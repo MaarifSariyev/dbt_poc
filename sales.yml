@@ -1,0 +1,43 @@
+name: sales
+description: "Yeni açılan depozitlər — satış hadisələri, filial, məhsul, term, valyuta üzrə aqreqasiya olunmuş"
+source_table: sales
+
+entities: []
+
+dimensions:
+  - column: tarix
+    type: time
+    granularity: day
+  - column: term
+    type: categorical
+    allowed_values: [6, 12, 18, 24, 30, 36]
+  - column: PRODUCT_CODE
+    type: categorical
+    allowed_values: ["KADP", "DGDP", "SVAC", "MSDP", "NFDP"]
+  - column: PAYMENT_PERIODICITY
+    type: categorical
+    allowed_values: ["A", "M", "KA"]
+  - column: CURRENCY_CODE
+    type: categorical
+    allowed_values: ["AZN", "USD"]
+  - column: IS_VIP
+    type: categorical
+    allowed_values: ["YES", "NO"]
+  - column: IS_RESIDENT
+    type: categorical
+    allowed_values: ["YES", "NO"]
+  - column: Branch
+    type: categorical
+    allowed_values: ["Branch", "Digital"]
+
+measures:
+  - column: initial_amount_azn_sum
+    default_agg: sum
+  - column: CONTRACT_REF_NO_count
+    default_agg: sum
+  - column: CIF_distinct
+    default_agg: sum
+    # DİQQƏT: "non-additive" sahə — bax portfolio_snapshot.yml-dəki qeyd
+  - column: interest_rate
+    default_agg: avg
+    # DİQQƏT: weighted average lazımdır (initial_amount_azn_sum-a görə), hələlik sadə AVG

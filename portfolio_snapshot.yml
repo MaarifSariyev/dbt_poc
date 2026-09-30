@@ -1,0 +1,66 @@
+name: portfolio_snapshot
+description: "Gündəlik depozit portfeli balansı — filial, məhsul, term, valyuta üzrə aqreqasiya olunmuş snapshot"
+source_table: portfolio_snapshot
+snapshot_date_column: BANK_DATE
+# Bu sahə mövcud olduqda, compiler.py filter verilməyibsə avtomatik
+# olaraq ən son BANK_DATE-i seçir (əks halda bütün tarixlər üzrə cəmlənib
+# mənasız, şişirdilmiş nəticə yaranır).
+
+entities: []
+# Qeyd: bu cədvəldə fərdi customer_id/branch_id join açarı yoxdur —
+# artıq aqreqasiya olunmuş sətirlərdir (dimension kombinasiyası üzrə qruplaşdırılıb)
+
+dimensions:
+  - column: BANK_DATE
+    type: time
+    granularity: day
+  - column: term
+    type: categorical
+    allowed_values: [6, 12, 18, 24, 30, 36]
+  - column: PRODUCT_CODE
+    type: categorical
+    allowed_values: ["KADP", "DGDP", "SVAC", "MSDP", "KSM3", "NFDP", "SM37", "QSX4"]
+  - column: PAYMENT_PERIODICITY
+    type: categorical
+    allowed_values: ["A", "M", "KA"]
+  - column: CURRENCY_CODE
+    type: categorical
+    allowed_values: ["AZN", "USD"]
+  - column: IS_VIP
+    type: categorical
+    allowed_values: ["YES", "NO", null]
+    # DİQQƏT: null (boş) dəyər real biznes mənası daşıyır — bu sətirlərdə
+    # VIP statusu təyin edilməyib/tətbiq olunmur. Filtr kimi bu dəyər
+    # istifadə oluna bilməz (LLM üçün mənasız olardı), amma group_by
+    # nəticəsində görünə bilər.
+  - column: IS_RESIDENT
+    type: categorical
+    allowed_values: ["YES", "NO"]
+  - column: Branch
+    type: categorical
+    allowed_values: ["Branch", "Digital"]
+  - column: CONTRACT_STATUS
+    type: categorical
+    allowed_values: [0, 1]
+    # QEYD: bu, HƏLƏLİK YER TUTUCUDUR — real Excel sxeminizdə bu sütun
+    # mövcud deyil. Real bank sisteminizdə (dwh.d_contract_deposit)
+    # "contract_status = 0" aktiv müqavilə mənasını verir (sizin real
+    # SQL-inizdən götürülüb). Əgər real Excel export-unuzda bu məlumat
+    # fərqli bir sütunda (məs. "IS_ACTIVE", "STATUS") saxlanılırsa, bu
+    # sətri o real ada uyğunlaşdırın.
+
+measures:
+  - column: Total_AMOUNT_AZN
+    default_agg: sum
+  - column: PRINCIPAL_AMOUNT_suN
+    default_agg: sum
+  - column: CONTRACT_Count
+    default_agg: sum
+  - column: CIF_countd
+    default_agg: sum
+    # DİQQƏT: sənədə görə "non-additive" sahədir — sətirlər üzrə cəmləmək
+    # təkrar saymaya səbəb ola bilər. Hələlik sadə SUM, irəlidə dəqiqləşdiriləcək.
+  - column: INTEREST_RATE
+    default_agg: avg
+    # DİQQƏT: sənədə görə Total_AMOUNT_AZN-ə görə weighted average olmalıdır,
+    # hələlik sadə AVG (razılaşdığımız kimi)

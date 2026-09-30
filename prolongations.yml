@@ -1,0 +1,47 @@
+name: prolongations
+description: "Uzadılan (prolongasiya olunan) depozitlər — filial, məhsul, term, valyuta üzrə aqreqasiya olunmuş"
+source_table: prolongations
+
+entities: []
+
+dimensions:
+  - column: tarix
+    type: time
+    granularity: day
+  - column: term
+    type: categorical
+    allowed_values: [6, 12, 18, 24, 30,36]
+  - column: PRODUCT_CODE
+    type: categorical
+    allowed_values: ["KADP", "DGDP", "SVAC", "MSDP", "SM37"]
+  - column: PAYMENT_PERIODICITY
+    type: categorical
+    allowed_values: ["A", "M", "KA"]
+  - column: CURRENCY_CODE
+    type: categorical
+    allowed_values: ["AZN", "USD"]
+  - column: is_vip
+    type: categorical
+    allowed_values: ["YES", "NO"]
+  - column: is_resident
+    type: categorical
+    allowed_values: ["YES", "NO"]
+  - column: Branch
+    type: categorical
+    allowed_values: ["Branch", "Digital"]
+
+measures:
+  - column: amount_sum_lcy
+    default_agg: sum
+  - column: amount_sum_fcy
+    default_agg: sum
+    # DİQQƏT: sənədə görə "Sum only after filtering or grouping by CURRENCY_CODE"
+    # — fərqli valyutaları birlikdə cəmləmək mənasızdır, group_by=[CURRENCY_CODE] tövsiyə olunur
+  - column: CONTRACT_count
+    default_agg: sum
+  - column: CIF_countd
+    default_agg: sum
+    # DİQQƏT: "non-additive" sahə
+  - column: INTEREST_RATE
+    default_agg: avg
+    # DİQQƏT: weighted average lazımdır (amount_sum_lcy-ə görə), hələlik sadə AVG

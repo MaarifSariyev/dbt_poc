@@ -1,0 +1,25 @@
+name: balance_movements
+description: "Depozit balansı hərəkətləri — yeni açılış, artım, azalma, bağlanma, reaktivasiya, sabit qalma"
+source_table: balance_movements
+
+entities: []
+
+dimensions:
+  - column: bank_date
+    type: time
+    granularity: day
+  - column: product_code
+    type: categorical
+    allowed_values: ["KADP", "DGDP", "SVAC", "MSDP"]
+  - column: type
+    type: categorical
+    allowed_values: ["New", "Increase", "Decrease", "Closed", "Reactivated", "Stable"]
+
+measures:
+  - column: amount_sum
+    default_agg: sum
+    # DİQQƏT: işarəli (signed) dəyərdir — Decrease üçün mənfi, sənədə görə
+    # "preserve the stored sign, and group/filter by type when needed"
+  - column: cif_distinct
+    default_agg: sum
+    # DİQQƏT: "non-additive" sahə
