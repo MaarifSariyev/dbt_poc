@@ -1,0 +1,570 @@
+# =============================================================================
+# SQL UNIT KATALOQU — MÜVƏQQƏTİ (PROVISIONAL)
+#
+# Bu kataloq YEKUN DEYİL. Domen eksperti yeni sual dəsti və Greenplum SQL-ləri
+# verəndən sonra yenidən yazılacaq. Hazırda burada olan unit-lərin məqsədi:
+#   * çərçivənin (retrieval -> parametr -> compiler -> icra) işlədiyini göstərmək;
+#   * hər əməliyyat tipini (aggregate, share, share_case_when, compare,
+#     time_series) ən azı bir dəfə işə salmaq.
+#
+# HƏR UNIT AQREQAT DƏNƏVƏRLİYƏ UYĞUNDUR. Bu datamartda müştəri identifikatoru
+# yoxdur, ona görə burada:
+#   * həqiqi count(distinct cif) YOXDUR;
+#   * müştəri çoxluqlarının kəsişməsi YOXDUR;
+#   * müştəri/müqavilə başına hədd (məs. "balansı 100 000-dən çox") YOXDUR.
+#
+# STRUKTUR:
+#   name           — retrieval-in seçdiyi ad
+#   description_az — embedding-ə düşən əsas mətn (nə edir / nə vaxt / gizli qayda)
+#   intents_az     — qısa niyyət ifadələri
+#   examples_az    — real istifadəçi ifadələri (embedding-ə düşür)
+#   operation      — compiler.py-dəki təsdiqlənmiş şablon
+#   based_on       — model + measure
+#   parameters     — icazə verilən parametrlər (required/optional)
+# =============================================================================
+
+# --- AGGREGATE ---------------------------------------------------------------
+- name: portfel_balansi
+  description_az: >-
+    NƏ EDİR: cari depozit portfelinin ÜMUMİ BALANSINI (AZN) qaytarır.
+    NƏ VAXT: "portfel nə qədərdir", "ümumi balans", "portfelin həcmi" kimi
+    suallarda. Valyuta, məhsul, filial, VIP üzrə filtr və qruplaşdırma olunur.
+    GİZLİ QAYDA: tarix verilməyibsə AVTOMATİK olaraq ən son gün götürülür —
+    bütün günləri cəmləmək mənasız, şişirdilmiş rəqəm verərdi.
+  see_also: [portfel_valyuta_payi]   # embed edilmir — yalnız sənədləşdirmə üçün
+  intents_az: ["portfel balansı", "ümumi depozit məbləği", "portfelin həcmi", "portfel nə qədərdir"]
+  examples_az:
+    - "depozit portfelinin ümumi balansı nə qədərdir"
+    - "USD depozitlərin cari balansı"
+    - "filial üzrə portfel balansı"
+  operation: aggregate
+  based_on:
+    model: portfolio_snapshot
+    measure: Total_AMOUNT_AZN
+  temporal_scope: latest_snapshot
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch, IS_VIP, IS_RESIDENT, PRODUCT_NAME]
+    group_by:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch, IS_VIP, IS_RESIDENT, PRODUCT_NAME]
+
+- name: satis_hecmi
+  description_az: >-
+    NƏ EDİR: seçilmiş dövrdə YENİ DEPOZIT SATIŞLARININ məbləğini (AZN) qaytarır.
+    NƏ VAXT: "nə qədər satış olub", "satış həcmi" suallarında.
+    GİZLİ QAYDA: bu FLOW (hadisə) ölçüsüdür — portfel balansı ilə CƏMLƏNMİR.
+    Dövr verilməyəndə AVTOMATİK son 6 ay götürülür (bütün tarixi göstərmək
+    istəyirsinizsə açıq şəkildə tarix aralığı təklif edin).
+  intents_az: ["satış həcmi", "yeni depozitlər", "satılan məbləğ"]
+  examples_az:
+    - "son ayda nə qədər depozit satılıb"
+    - "AZN üzrə satış həcmi"
+    - "term üzrə satışlar"
+  operation: aggregate
+  based_on:
+    model: sales
+    measure: initial_amount_azn_sum
+  temporal_scope: all_time
+  # Dövr verilməyəndə bütün tarixi (2018-2026) əvəzinə son 6 ay götürülür —
+  # ekspertin öz sorğularının default davranışı ilə uyğunlaşdırılıb.
+  default_period: last_n_months:6
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch, IS_VIP, IS_RESIDENT, term, tarix]
+    group_by:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch, term]
+
+# --- SHARE -------------------------------------------------------------------
+- name: portfel_valyuta_payi
+  description_az: >-
+    NƏ EDİR: bir alt-qrupun ümumi portfeldəki PAYINI faizlə hesablayır —
+    ADINDAKI "valyuta" sözünə baxmayaraq, bu metrika İSTƏNİLƏN alt-qrupun
+    (valyuta, kanal, VIP statusu, filial və s.) payını hesablaya bilər.
+    NƏ VAXT: "payı nədir", "neçə faizini təşkil edir", "share" suallarında —
+    valyuta, kanal, VIP statusu, filial və digər istənilən kateqoriya üzrə.
+    GİZLİ QAYDA: scope_filters HƏM say, HƏM məxrəcə tətbiq olunur (məs. "saving
+    müştəriləri arasında"); subgroup_filters yalnız SAYA tətbiq olunur
+    (məs. "USD olanlar"). İkisini qarışdırmaq yanlış faiz verər.
+  intents_az: ["portfel payı", "faiz payı", "share", "payı nədir",
+               "neçə faizini təşkil edir", "portfeldə payı"]
+  examples_az:
+    - "USD depozitlərin portfeldə payı nədir"
+    - "digital kanalın portfeldəki payı"
+    - "VIP müştərilərin payı"
+  operation: share
+  based_on:
+    model: portfolio_snapshot
+    measure: Total_AMOUNT_AZN
+  temporal_scope: latest_snapshot
+  parameters:
+    scope_filters:
+      optional: [PRODUCT_CODE, Branch, IS_RESIDENT]
+    subgroup_filters:
+      optional: [CURRENCY_CODE, PRODUCT_CODE, Branch, IS_VIP]
+    group_by:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch]
+
+# --- SHARE_CASE_WHEN ---------------------------------------------------------
+- name: digital_vs_filial_satis_payi
+  description_az: >-
+    NƏ EDİR: DIGITAL və FİLİAL satışlarını YAN-YANA, eyni sətirdə müqayisə edir
+    və digital payını faizlə verir. Həm məbləğ, həm müqavilə sayı üzrə.
+    NƏ VAXT: "digital satışların payı", "rəqəmsal vs filial" suallarında.
+    GİZLİ QAYDA: bölgü "Branch" sütunundadır — dəyərlər 'Digital' və 'Filial'.
+    Dövr verilməyəndə son 6 ay götürülür.
+  intents_az: ["digital satış payı", "rəqəmsal kanal payı", "digital vs filial"]
+  examples_az:
+    - "digital satışların payı nə qədərdir"
+    - "rəqəmsal kanalın satışdakı payı term üzrə"
+    - "digital və filial satışlarını müqayisə et"
+  operation: share_case_when
+  based_on:
+    model: sales
+    measure: initial_amount_azn_sum
+  case_column: Branch
+  case_value_a: Digital
+  case_value_b: Filial
+  label_a: digital
+  label_b: filial
+  temporal_scope: all_time
+  default_period: last_n_months:6
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, term, tarix, IS_VIP]
+    group_by:
+      optional: [term, PRODUCT_CODE, CURRENCY_CODE]
+
+# --- TIME_SERIES -------------------------------------------------------------
+- name: satis_ayliq_trend
+  description_az: >-
+    NƏ EDİR: satışların AYLIQ trendini və hər ayın əvvəlki aya nisbətən
+    faiz dəyişməsini qaytarır (bir sətir = bir ay).
+    NƏ VAXT: "trend", "necə dəyişib", "artıb yoxsa azalıb" suallarında.
+    GİZLİ QAYDA: bitməmiş CARİ AY avtomatik kənarlaşdırılır — yarımçıq ay
+    saxta eniş göstərir. "Bu ay indiyə qədər" soruşulsa, cari ay daxil edilir.
+  see_also: [satis_dovr_muqayisesi]  # embed edilmir
+  intents_az: ["satış trendi", "aylıq dinamika", "artım tempi",
+               "son 12 ayda necə dəyişib", "son aylarda satışlar"]
+  examples_az:
+    - "son 12 ayda satışlar necə dəyişib"
+    - "USD depozit satışlarının trendi"
+    - "aylıq satış dinamikası"
+  operation: time_series
+  based_on:
+    model: sales
+    measure: initial_amount_azn_sum
+  time_column: tarix
+  granularity: month
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch, term, tarix]
+
+# --- COMPARE -----------------------------------------------------------------
+- name: satis_dovr_muqayisesi
+  description_az: >-
+    NƏ EDİR: İKİ KONKRET DÖVRÜ yan-yana müqayisə edir (hər dövr üçün bir sətir).
+    NƏ VAXT: "əvvəlki dövrlə müqayisə", "bu ay vs keçən ay", "faiz dəyişikliyindən
+    əvvəl və sonra" suallarında.
+    GİZLİ QAYDA: dövrlər period_a_filters / period_b_filters ilə verilir —
+    hər biri müstəqil tarix aralığıdır. Tarix dəyəri YA sabit tarix formatında
+    ("2025-10-15"), YA da nisbi dövr formatında ("last_n_months:6",
+    "last_n_days:30") olmalıdır. Məsələn "son 6 ayla əvvəlki 6 ayı müqayisə et"
+    üçün: period_a_filters=[{{"column":"tarix","operator":">=","value":"last_n_months:6"}}],
+    period_b_filters=[{{"column":"tarix","operator":">=","value":"last_n_months:12"}},
+    {{"column":"tarix","operator":"<","value":"last_n_months:6"}}].
+  see_also: [satis_ayliq_trend]      # embed edilmir
+  intents_az: ["dövr müqayisəsi", "əvvəl və sonra", "iki dövrü tutuşdur"]
+  examples_az:
+    - "bu ilin satışlarını keçən illə müqayisə et"
+    - "faiz dəyişikliyindən əvvəlki və sonrakı satışlar"
+    - "son 6 ay ilə əvvəlki 6 ayı tutuşdur"
+  operation: compare
+  based_on:
+    model: sales
+    measure: initial_amount_azn_sum
+  period_a_label: son_dovr
+  period_b_label: onceki_dovr
+  parameters:
+    period_a_filters:
+      required: [tarix]
+    period_b_filters:
+      required: [tarix]
+    group_by:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch, term]
+
+# --- AGGREGATE (flow) --------------------------------------------------------
+- name: portfel_hereketi
+  description_az: >-
+    NƏ EDİR: portfel hərəkətini tip üzrə qaytarır — New (yeni), Closed (bağlanan),
+    Increase (artan), Decrease (azalan), Stable (sabit), Reactivated (bərpa).
+    Sadə cəm — hər tip öz sətrində.
+    NƏ VAXT: "neçə müştəri gəlib/gedib", "portfel hərəkəti", "churn" kimi TİP
+    ÜZRƏ SADƏ CƏM istəyən suallarda.
+    GİZLİ QAYDA: bu cədvəldə YALNIZ tarix, məhsul və tip var — valyuta, term,
+    filial ölçüləri YOXDUR. cif_distinct sətirlər üzrə cəmlənə bilməz.
+    Dövr verilməyəndə son 6 ay götürülür.
+    FƏRQ: əgər sual "xalis axın", "net liquidity", "inflow/outflow", ya da
+    genişlənmə(New+Reactivated)/sabit(Stable)/çıxış(Decrease)/bağlanma(Closed)
+    KATEQORİYALARININ EYNİ SƏTİRDƏ YAN-YANA göstərilməsini istəyirsə, bunun
+    ƏVƏZİNƏ likvidlik_axini istifadə et — bu, fərqli çıxış formasıdır.
+    DİQQƏT — sütun adı: bu modeldə tarix sütunu YALNIZ 'bank_date'-dir
+    ('tarix' YOX — o, sales/prolongations modellərinin sütunudur).
+  see_also: [likvidlik_axini]  # embed edilmir
+  intents_az: ["portfel hərəkəti", "yeni və bağlanan", "churn"]
+  examples_az:
+    - "neçə yeni depozit müştərisi gəlib"
+    - "bağlanan depozitlərin məbləği"
+    - "portfel hərəkəti tip üzrə"
+  operation: aggregate
+  based_on:
+    model: balance_movements
+    measure: amount_sum
+  temporal_scope: all_time
+  default_period: last_n_months:6
+  parameters:
+    filters:
+      optional: [product_code, type, bank_date]
+    group_by:
+      optional: [type, product_code]
+
+# =============================================================================
+# EKSPERT SUAL DƏSTİNƏ (inputs/q_a_deposit.md) UYĞUN UNIT-LƏR
+# Hər unit-in şərhində hansı suala cavab verdiyi göstərilib.
+# =============================================================================
+
+# --- Q5: VIP vs qeyri-VIP konsentrasiya (portfel) ----------------------------
+- name: vip_konsentrasiyasi
+  description_az: >-
+    NƏ EDİR: portfeli VIP və qeyri-VIP üzrə bölür — həcm, müqavilə sayı və
+    ÇƏKİLİ ORTA faiz dərəcəsi.
+    NƏ VAXT: "VIP müştərilər", "VIP payı", "VIP konsentrasiyası" suallarında.
+    GİZLİ QAYDA: faiz dərəcəsi məbləğə görə çəkilir — sadə orta yanlış olardı.
+    IS_VIP boş olanlar "NO" sayılır.
+  intents_az: ["VIP konsentrasiyası", "VIP vs qeyri-VIP", "VIP payı"]
+  examples_az:
+    - "VIP və qeyri-VIP müştərilərin portfeldəki payı nədir"
+    - "VIP müştərilər üzrə çəkili orta faiz dərəcəsi"
+    - "məhsullar üzrə VIP konsentrasiyası"
+  operation: breakdown
+  based_on: {model: portfolio_snapshot}
+  temporal_scope: latest_snapshot
+  outputs:
+    - {name: total_contracts, kind: sum, measure: CONTRACT_Count}
+    - {name: total_amount_azn, kind: sum, measure: Total_AMOUNT_AZN, round: 2}
+    - {name: weighted_avg_rate_pct, kind: weighted_avg, measure: INTEREST_RATE,
+       weight: Total_AMOUNT_AZN, round: 2}
+    - {name: volume_share_pct, kind: share_of_total, measure: Total_AMOUNT_AZN, round: 2}
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, Branch, IS_VIP, IS_RESIDENT, term]
+    group_by:
+      optional: [PRODUCT_CODE, IS_VIP, CURRENCY_CODE, term, Branch, IS_RESIDENT]
+
+# --- Q16/Q17/Q18: portfel strukturu + çəkili faiz ----------------------------
+- name: portfel_strukturu
+  description_az: >-
+    NƏ EDİR: portfeli istənilən ölçü üzrə bölür — müqavilə sayı, balans,
+    ÇƏKİLİ ORTA faiz və hər sətrin ümumidəki payı.
+    NƏ VAXT: "term üzrə", "valyuta üzrə", "ödəniş periodikliyi üzrə",
+    "kanal üzrə", "rezidentlik üzrə" struktur suallarında.
+    GİZLİ QAYDA: faiz PRINCIPAL_AMOUNT_suN-a görə çəkilir.
+  intents_az: ["portfel strukturu", "bölgü", "paylanma", "term üzrə portfel"]
+  examples_az:
+    - "DGDP üzrə term və valyuta bölgüsü nədir"
+    - "KADP portfeli ödəniş periodikliyi üzrə necə paylanıb"
+    - "məhsullar üzrə kanal bölgüsü"
+  operation: breakdown
+  based_on: {model: portfolio_snapshot}
+  temporal_scope: latest_snapshot
+  outputs:
+    - {name: contract_count, kind: sum, measure: CONTRACT_Count}
+    - {name: total_balance_azn, kind: sum, measure: Total_AMOUNT_AZN, round: 2}
+    - {name: weighted_avg_rate_pct, kind: weighted_avg, measure: INTEREST_RATE,
+       weight: PRINCIPAL_AMOUNT_suN, round: 2}
+    - {name: share_pct, kind: share_of_total, measure: Total_AMOUNT_AZN, round: 2}
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, term, PAYMENT_PERIODICITY, Branch,
+                 IS_VIP, IS_RESIDENT]
+    group_by:
+      optional: [PRODUCT_CODE, term, CURRENCY_CODE, PAYMENT_PERIODICITY, Branch,
+                 IS_RESIDENT, IS_VIP]
+
+# --- Q7/Q9/Q10/Q11: portfel hərəkəti (flow) ----------------------------------
+- name: likvidlik_axini
+  description_az: >-
+    NƏ EDİR: pul axınını tip üzrə ayırır — daxilolma (New, Reactivated),
+    sabit (Stable), qismən çıxış (Decrease), bağlanma (Closed) və xalis axın —
+    HAMISI EYNİ SƏTİRDƏ, yan-yana sütun kimi.
+    NƏ VAXT: "likvidlik", "xalis axın", "net liquidity", "nə qədər pul gəlib/gedib",
+    "yeni vs bərpa olunmuş" kimi KATEQORİYALARIN YAN-YANA MÜQAYİSƏSİNİ istəyən
+    suallarda.
+    GİZLİ QAYDA: Decrease məbləği mənfidir, çıxış hesabında mütləq dəyər alınır.
+    Dövr verilməyəndə son 6 ay götürülür.
+    FƏRQ: əgər sual sadəcə "tip üzrə cəm" (hər tip öz sətrində, sadə aggregate)
+    istəyirsə, bunun ƏVƏZİNƏ portfel_hereketi istifadə et.
+    DİQQƏT — sütun adı: bu modeldə tarix sütunu YALNIZ 'bank_date'-dir
+    ('tarix' YOX — o, sales/prolongations modellərinin sütunudur).
+  see_also: [portfel_hereketi]  # embed edilmir
+  intents_az: ["likvidlik axını", "xalis pul hərəkəti", "daxilolma və çıxış"]
+  examples_az:
+    - "son 30 gündə məhsullar üzrə xalis likvidlik axını nədir"
+    - "yeni pul ilə bərpa olunmuş pulu müqayisə et"
+    - "hansı məhsuldan nə qədər pul çıxıb"
+  operation: breakdown
+  based_on: {model: balance_movements}
+  temporal_scope: all_time
+  default_period: last_n_months:6
+  outputs:
+    - {name: expansion_inflow, kind: sum_where, measure: amount_sum, column: type,
+       values: [New, Reactivated], round: 2}
+    - {name: stable_volume, kind: sum_where, measure: amount_sum, column: type,
+       values: [Stable], round: 2}
+    - {name: partial_outflow, kind: sum_where, measure: amount_sum, column: type,
+       values: [Decrease], absolute: true, round: 2}
+    - {name: closed_volume, kind: sum_where, measure: amount_sum, column: type,
+       values: [Closed], round: 2}
+    - {name: net_liquidity_flow, kind: sum, measure: amount_sum, round: 2}
+  allow_approximate: true
+  parameters:
+    filters:
+      optional: [product_code, type, bank_date]
+    group_by:
+      optional: [product_code, type, bank_date]
+
+# --- Q10: aylıq outflow/inflow nisbəti (breakdown + aylıq granularity) ------
+# likvidlik_axini-dən FƏRQİ: likvidlik_axini statik (bir dövr üçün bir sətir)
+# nəticə verir. Bu unit isə HƏR AY ÜÇÜN AYRICA SƏTIR + birbaşa outflow/inflow
+# NİSBƏTİNİ (faizlə) qaytarır — time_column/granularity ilə breakdown-un
+# çox-measure gücü, aylıq ayırma ilə birləşdirilib.
+- name: likvidlik_aylik_nisbeti
+  description_az: >-
+    NƏ EDİR: HƏR AY ÜÇÜN AYRICA SƏTİRDƏ, ümumi daxilolma (New+Reactivated),
+    ümumi çıxış (Decrease+Closed, mütləq dəyər) və ÇIXIŞIN DAXİLOLMAYA
+    NİSBƏTİNİ (faizlə) qaytarır — məhsul üzrə.
+    NƏ VAXT: "aylıq outflow/inflow nisbəti", "hər ay üçün çıxış-giriş nisbəti",
+    "leaked volume / inflow volume" kimi AYLIQ DETAL + NİSBƏT tələb edən
+    suallarda.
+    GİZLİ QAYDA: Decrease və Closed birlikdə "gross_outflow" sayılır, New və
+    Reactivated birlikdə "gross_inflow" sayılır. Nisbət gross_outflow-un
+    gross_inflow-a faiz nisbətidir.
+    FƏRQ: əgər sual AYLIQ DETAL TƏLƏB ETMİRSƏ (sadəcə bir dövr üçün ümumi
+    ədəd), bunun ƏVƏZİNƏ likvidlik_axini istifadə et — o, daha sadədir.
+    DİQQƏT — sütun adı: bu modeldə tarix sütunu YALNIZ 'bank_date'-dir.
+  see_also: [likvidlik_axini]  # embed edilmir
+  intents_az: ["aylıq outflow inflow nisbəti", "çıxış giriş nisbəti", "leaked volume"]
+  examples_az:
+    - "hər ay üçün çıxışın girişə nisbəti nə qədərdir"
+    - "aylıq outflow severity ratio məhsul üzrə"
+    - "hansı ay ən çox pul çıxıb, girişlə müqayisədə"
+  operation: breakdown
+  based_on: {model: balance_movements}
+  temporal_scope: all_time
+  default_period: last_n_months:6
+  time_column: bank_date
+  granularity: month
+  allow_approximate: true
+  outputs:
+    - {name: gross_inflow, kind: sum_where, measure: amount_sum, column: type,
+       values: [New, Reactivated], round: 2}
+    - {name: gross_outflow, kind: sum_where, measure: amount_sum, column: type,
+       values: [Decrease, Closed], absolute: true, round: 2}
+    - {name: outflow_to_inflow_ratio_pct, kind: ratio,
+       numerator: amount_sum, denominator: amount_sum,
+       numerator_filter: {column: type, values: [Decrease, Closed], absolute: true},
+       denominator_filter: {column: type, values: [New, Reactivated]},
+       as_percentage: true, round: 2}
+  parameters:
+    filters:
+      optional: [product_code, bank_date]
+    group_by:
+      optional: [product_code]
+
+# --- Q11: axın kateqoriyası üzrə orta ---------------------------------------
+- name: axin_uzre_orta_depozit
+  description_az: >-
+    NƏ EDİR: hər axın kateqoriyası üzrə ümumi həcmi, müştəri sayını və
+    MÜŞTƏRİ BAŞINA orta məbləği verir.
+    NƏ VAXT: "müştəri başına orta", "orta depozit ölçüsü" suallarında.
+    GİZLİ QAYDA: müştəri sayı TƏXMİNİDİR — eyni müştəri bir neçə məhsulda
+    təkrar sayıla bilər. Dövr verilməyəndə son 6 ay götürülür.
+    ƏGƏR sual AÇIQ ŞƏKİLDƏ "dəqiq", "unikal", "təkrarsız" müştəri sayı tələb
+    edirsə, bu metrika UYĞUN DEYİL (sistemdə dəqiq unikal müştəri sayğıcı
+    yoxdur) — bu halda {{"error": "no_matching_metric"}} qaytar, təxmini
+    ədədi dəqiq kimi təqdim ETMƏ.
+    DİQQƏT — sütun adı: bu modeldə tarix sütunu YALNIZ 'bank_date'-dir
+    ('tarix' YOX — o, sales/prolongations modellərinin sütunudur).
+  intents_az: ["müştəri başına orta məbləğ", "orta depozit ölçüsü"]
+  examples_az:
+    - "hər axın kateqoriyasında müştəri başına orta depozit nə qədərdir"
+    - "orta depozit ölçüsü tip üzrə"
+  operation: breakdown
+  based_on: {model: balance_movements}
+  temporal_scope: all_time
+  default_period: last_n_months:6
+  allow_approximate: true
+  outputs:
+    - {name: total_volume, kind: sum, measure: amount_sum, round: 2}
+    - {name: total_cifs, kind: sum, measure: cif_distinct}
+    - {name: avg_amount_per_cif, kind: ratio, numerator: amount_sum,
+       denominator: cif_distinct, round: 2}
+  parameters:
+    filters:
+      optional: [product_code, type, bank_date]
+    group_by:
+      optional: [type, product_code]
+
+# --- Q12/Q14: uzadılmalar (prolongation) ------------------------------------
+- name: uzadilma_icmali
+  description_az: >-
+    NƏ EDİR: uzadılmış (prolonqasiya) depozitləri AY VƏ TERM ÜZRƏ bölür —
+    hər ay+term üçün ayrıca sətirdə müqavilə sayı, məbləğ (AZN və xarici
+    valyuta), orta bilet və ümumidəki pay.
+    NƏ VAXT: "aylıq uzadılma", "monthly renewal breakdown", "prolonqasiya
+    aylıq bölgü", "ay-ay uzadılma həcmi" suallarında.
+    GİZLİ QAYDA: aylıq qruplaşdırma DAXİLDƏ AVTOMATİKDİR (tarix sütunu üzrə
+    date_trunc('month',...)) — group_by-a AYRICA TARİX SÜTUNU ("tarix")
+    ƏLAVƏ ETMƏ, avtomatik olaraq nəticədə "period" adlı sütun kimi görünür.
+    amount_sum_lcy manat, amount_sum_fcy xarici valyutadır.
+    Dövr verilməyəndə son 6 ay götürülür (bu, aylıq pəncərənin uzunluğudur,
+    hər ay öz sətrində qalır).
+  intents_az: ["uzadılma həcmi", "prolonqasiya", "depozit yeniləmələri", "aylıq uzadılma"]
+  examples_az:
+    - "son 6 ayda məhsullar üzrə uzadılmış depozit həcmi nədir"
+    - "hansı term və periodiklik uzadılmalarda üstünlük təşkil edir"
+    - "uzadılmalarda orta müqavilə məbləği"
+    - "AZN-də term üzrə aylıq uzadılma həcmi nədir"
+  operation: breakdown
+  based_on: {model: prolongations}
+  temporal_scope: all_time
+  default_period: last_n_months:12
+  time_column: tarix
+  granularity: month
+  allow_approximate: true
+  outputs:
+    - {name: prolonged_contracts, kind: sum, measure: CONTRACT_count}
+    - {name: prolonged_cifs, kind: sum, measure: CIF_countd}
+    - {name: total_prolonged_lcy, kind: sum, measure: amount_sum_lcy, round: 2}
+    - {name: total_prolonged_fcy, kind: sum, measure: amount_sum_fcy, round: 2}
+    - {name: avg_contract_ticket_lcy, kind: ratio, numerator: amount_sum_lcy,
+       denominator: CONTRACT_count, round: 2}
+    - {name: share_pct, kind: share_of_total, measure: amount_sum_lcy, round: 2}
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, term, PAYMENT_PERIODICITY, tarix,
+                 is_vip, is_resident, Branch]
+    group_by:
+      optional: [PRODUCT_CODE, term, PAYMENT_PERIODICITY, CURRENCY_CODE, Branch]
+
+# --- Q19/Q20/Q21/Q22: satış strukturu ---------------------------------------
+- name: satis_strukturu
+  description_az: >-
+    NƏ EDİR: satışları istənilən ölçü üzrə bölür — müqavilə sayı, məbləğ,
+    ÇƏKİLİ ORTA faiz, orta bilet və ÜMUMİ SATIŞDAKI PAYI (sales_share_pct —
+    bütün satışın 100%-i əsasında hesablanır, HƏR MƏHSULUN öz 100%-i DEYİL).
+    NƏ VAXT: "satışlar necə paylanıb", "hansı term/valyuta/kanal üstündür",
+    "orta bilet", "VIP satışları", "ÜMUMİ satışdakı payı" suallarında.
+    GİZLİ QAYDA: faiz satış məbləğinə görə çəkilir. Dövr verilməyəndə
+    son 6 ay götürülür.
+    FƏRQ: əgər sual "hər məhsulun ÖZ DAXİLİNDƏ kanal nisbəti" (məs. "DGDP-nin
+    özündə rəqəmsal payı neçədir", "hər məhsulda digital-ın öz daxilindəki
+    payı") formasındadırsa, sales_share_pct BURADA YANLIŞ OLAR (o, ümumi
+    satışa nisbətdir) — bunun ƏVƏZİNƏ kanal_miksi_satis istifadə et.
+  intents_az: ["satış strukturu", "satış bölgüsü", "orta bilet", "satış payı"]
+  examples_az:
+    - "digital depozit satışlarında hansı term və valyuta üstünlük təşkil edir"
+    - "ənənəvi depozit satışları periodiklik və rezidentlik üzrə necə paylanıb"
+    - "SVAC satışlarında VIP və qeyri-VIP bölgüsü"
+  operation: breakdown
+  based_on: {model: sales}
+  temporal_scope: all_time
+  default_period: last_n_months:6
+  allow_approximate: true
+  see_also: [kanal_miksi_satis]   # embed edilmir
+  outputs:
+    - {name: contracts_sold, kind: sum, measure: CONTRACT_REF_NO_count}
+    - {name: distinct_cifs, kind: sum, measure: CIF_distinct}
+    - {name: total_sales_azn, kind: sum, measure: initial_amount_azn_sum, round: 2}
+    - {name: weighted_avg_rate_pct, kind: weighted_avg, measure: interest_rate,
+       weight: initial_amount_azn_sum, round: 2}
+    - {name: avg_ticket_size_azn, kind: ratio, numerator: initial_amount_azn_sum,
+       denominator: CONTRACT_REF_NO_count, round: 2}
+    - {name: sales_share_pct, kind: share_of_total, measure: initial_amount_azn_sum, round: 2}
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, term, PAYMENT_PERIODICITY, Branch,
+                 IS_VIP, IS_RESIDENT, tarix]
+    group_by:
+      optional: [PRODUCT_CODE, term, CURRENCY_CODE, PAYMENT_PERIODICITY, Branch,
+                 IS_VIP, IS_RESIDENT]
+
+# --- Q22: kanal miksi (satış) — MƏHSUL DAXİLİNDƏ kanal nisbəti ---------------
+# satis_strukturu-dan FƏRQİ: satis_strukturu-nun sales_share_pct-i ÜMUMİ
+# satış içindəki payı verir (over ()). Bu unit isə HƏR MƏHSULUN ÖZ DAXİLİNDƏ
+# kanal (Digital/Filial) nisbətini verir (over (partition by PRODUCT_CODE)).
+# İkisi riyazi olaraq FƏRQLİ suallara cavab verir — buna görə ayrı unit-dir,
+# partition_by dinamik seçilmir (LLM strukturu dəyişə bilməz).
+- name: kanal_miksi_satis
+  description_az: >-
+    NƏ EDİR: HƏR MƏHSULUN öz daxilində Digital və Filial kanallarının
+    nisbətini verir (channel_share_within_product_pct — hər məhsulun ÖZ 100%-i
+    daxilində hesablanır, ÜMUMİ satışa nisbət DEYİL).
+    NƏ VAXT: "kanal miksi", "hər məhsulda rəqəmsal payı nə qədərdir",
+    "məhsul daxilində kanal bölgüsü" suallarında.
+    GİZLİ QAYDA: bu, ÜMUMİ satışdakı payı DEYİL — hər məhsulun ÖZ 100%-i
+    daxilində kanal nisbətidir.
+    FƏRQ: əgər sual "ÜMUMİ satışdakı payı" (bütün satışın 100%-i əsasında,
+    kanaldan asılı olmayaraq) istəyirsə, bunun ƏVƏZİNƏ satis_strukturu
+    istifadə et. Dövr verilməyəndə son 6 ay götürülür.
+  see_also: [satis_strukturu, kanal_miksi_portfel]  # embed edilmir
+  intents_az: ["kanal miksi", "məhsul daxilində kanal payı", "rəqəmsal kanal nisbəti"]
+  examples_az:
+    - "SVAC, DGDP, KADP və MSDP arasında hər məhsulun öz daxilində rəqəmsal və filial satışlarının nisbəti nədir"
+    - "hər məhsulda digital satışların öz daxilindəki payı nə qədərdir"
+    - "məhsul üzrə kanal miksini göstər"
+  operation: breakdown
+  based_on: {model: sales}
+  temporal_scope: all_time
+  default_period: last_n_months:6
+  allow_approximate: true
+  outputs:
+    - {name: contracts_sold, kind: sum, measure: CONTRACT_REF_NO_count}
+    - {name: distinct_cifs, kind: sum, measure: CIF_distinct}
+    - {name: total_sales_azn, kind: sum, measure: initial_amount_azn_sum, round: 2}
+    - {name: channel_share_within_product_pct, kind: share_of_total,
+       measure: initial_amount_azn_sum, partition_by: [PRODUCT_CODE], round: 2}
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, term, tarix]
+    group_by:
+      optional: [PRODUCT_CODE, Branch]
+
+# --- Q18: kanal miksi (portfel) — MƏHSUL DAXİLİNDƏ kanal nisbəti -------------
+- name: kanal_miksi_portfel
+  description_az: >-
+    NƏ EDİR: HƏR MƏHSULUN öz portfel balansı daxilində Digital və Filial
+    kanallarının nisbətini verir (məhsul üzrə 100%-ə çatan pay).
+    NƏ VAXT: "portfeldə kanal miksi", "hər məhsulun balansında rəqəmsal
+    payı" suallarında.
+    GİZLİ QAYDA: portfel_strukturu-nun payı ÜMUMİ portfeldəki paydır; bu
+    unit isə HƏR MƏHSULUN ÖZ daxilindəki kanal nisbətidir.
+  see_also: [portfel_strukturu, kanal_miksi_satis]  # embed edilmir
+  intents_az: ["portfel kanal miksi", "balansda kanal payı"]
+  examples_az:
+    - "SVAC, DGDP, KADP və MSDP portfelində hər məhsulun öz daxilində rəqəmsal və filial balansının nisbəti nədir"
+    - "hər məhsulun balansında digital kanalın öz daxilindəki payı"
+  operation: breakdown
+  based_on: {model: portfolio_snapshot}
+  temporal_scope: latest_snapshot
+  allow_approximate: true
+  outputs:
+    - {name: contract_count, kind: sum, measure: CONTRACT_Count}
+    - {name: distinct_cifs, kind: sum, measure: CIF_countd}
+    - {name: total_balance_azn, kind: sum, measure: Total_AMOUNT_AZN, round: 2}
+    - {name: channel_share_within_product_pct, kind: share_of_total,
+       measure: Total_AMOUNT_AZN, partition_by: [PRODUCT_CODE], round: 2}
+  parameters:
+    filters:
+      optional: [PRODUCT_CODE, CURRENCY_CODE, IS_VIP, IS_RESIDENT]
+    group_by:
+      optional: [PRODUCT_CODE, Branch]
