@@ -1,11 +1,15 @@
 """
-Semantic Layer Compiler v2 — 3 ÜMUMİ ƏMƏLİYYAT üzərində qurulub:
+Semantic Layer Compiler v2 — təkrar istifadə olunan ÜMUMİ ƏMƏLİYYATLAR:
 
   1. AGGREGATE — bir measure-u (filters + group_by ilə) cəmləmək/saymaq/ortalamaq
   2. SHARE      — bir alt-qrupun bütövə nisbəti (AGGREGATE-in üstündə)
   3. COMPARE    — iki filtr toplusunun (iki dövr, iki kanal, s.) müqayisəsi
+  4. TIME SERIES — flow məlumatının gün/ay/kvartal/il trendi
+  5. SNAPSHOT TIME SERIES — stock məlumatında hər dövrün son snapshot trendi
+  6. BREAKDOWN  — bir neçə təsdiqlənmiş çıxışla ölçülər üzrə bölgü
+  7. RANKED BREAKDOWN — cari və ya hər dövr daxilində top/bottom sıralama
 
-Hər metrika (metrics.yml-də) bu 3 əməliyyatdan BİRİNİN parametrləşdirilmiş
+Hər unit (units.yml-də) bu əməliyyatlardan BİRİNİN parametrləşdirilmiş
 çağırışıdır — yeni sual tipi üçün yeni SQL YAZILMIR, mövcud əməliyyat
 fərqli parametrlərlə çağırılır.
 
@@ -16,6 +20,7 @@ import os
 import re
 
 import yaml
+from . import domain_policy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,17 +31,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Bu fayl semantic_poc/compiler.py-dən götürülüb. Mühərrik dəyişməyib —
 # yalnız aşağıdakı hədəf-spesifik düzəlişlər edilib:
 #
-#   1. İDENTİFİKATOR DIRNAQLARI — dataiku_ai_coe cədvəllərində sütun adları
-#      qarışıq registrlidir ("BANK_DATE", "Branch", "CIF_countd"). PostgreSQL
-#      dırnaqsız adları kiçik hərfə salır, ona görə dırnaqsız SQL işləmir.
+#   1. İDENTİFİKATOR DIRNAQLARI — sütun adları dırnağa alınır. Datamart
+#      07.09.2026-da kiçik hərfə keçirilib, amma cədvəl adı hələ də qarışıq
+#      registrlidir ("AIDASHBOARD_dm_deposit_portfolio_ai") və dırnaqsız
+#      PostgreSQL onu kiçik hərfə salıb tapa bilmir.
 #   2. round(x, 2) -> round(x::numeric, 2) — PostgreSQL-də double precision
 #      üçün iki arqumentli round YOXDUR (işləmə zamanı xəta verir).
 #   3. Sətir dəyərləri kaçırılır (' -> '') — SQL injection səthini bağlayır.
 #   4. overlap əməliyyatı SİLİNİB — müştəri səviyyəsində açar tələb edir,
 #      aqreqasiya olunmuş datamartda belə açar yoxdur.
-#   5. Measure sütunlarına filtr QADAĞANDIR — aqreqat sətirdə "balansı
-#      100 000-dən çox müştəri" kimi şərt yanlış nəticə verir.
-#   6. Non-additive measure-lər (CIF_countd və s.) sətirlər üzrə cəmlənə
+#   5. Measure sütunlarına adi WHERE filtri QADAĞANDIR — aqreqat sətirdə
+#      "balansı 100 000-dən çox müştəri" kimi şərt yanlış nəticə verir.
+#      Ekspertin təsdiqlədiyi measure-lər yalnız conditional output daxilində
+#      model metadata-sındakı `conditional_filter` icazəsi ilə işləyir.
+#   6. Non-additive measure-lər (cif_countd və s.) sətirlər üzrə cəmlənə
 #      bilməz — unit açıq şəkildə icazə verməyibsə rədd olunur.
 # ---------------------------------------------------------------------------
 
@@ -58,6 +66,25 @@ def _lit(value) -> str:
 RELATIVE_PERIOD = re.compile(r"^last_n_(months|days):(\d{1,4})$")
 MAX_RELATIVE_MONTHS = 120
 MAX_RELATIVE_DAYS = 1095
+LATEST_DATE = "__LATEST_DATE__"
+CURRENT_MONTH = "__CURRENT_MONTH__"
+TREND_OPERATIONS = ("time_series", "snapshot_time_series")
+
+
+class ParameterValidationError(ValueError):
+    """LLM parameter payload is invalid; bounded re-inference may repair it."""
+
+
+def is_trend_unit(unit: dict) -> bool:
+    return (unit.get("operation") in TREND_OPERATIONS
+            or (unit.get("operation") == "ranked_breakdown" and bool(unit.get("time_column"))))
+
+
+def latest_date_sql(model: dict) -> str:
+    column = find_time_dimension(model)
+    if not column:
+        raise ValueError("Modelin zaman sütunu yoxdur")
+    return f"(select max({_q(column)}) from {_tbl(model)})"
 
 
 def relative_period_sql(value: str) -> str:
@@ -67,19 +94,21 @@ def relative_period_sql(value: str) -> str:
 
     Yalnız bu iki forma. Sərbəst tarix arifmetikası qəbul edilmir.
     """
+    if value == CURRENT_MONTH:
+        return "date_trunc('month', current_date)"
     match = RELATIVE_PERIOD.match(str(value))
     if not match:
-        raise ValueError(
+        raise ParameterValidationError(
             f"Yararsız nisbi dövr: {value!r} "
             f"(gözlənilir: last_n_months:N və ya last_n_days:N)"
         )
     unit, amount = match.group(1), int(match.group(2))
     if unit == "months":
         if not 1 <= amount <= MAX_RELATIVE_MONTHS:
-            raise ValueError(f"Ay sayı 1-{MAX_RELATIVE_MONTHS} aralığında olmalıdır, gəldi: {amount}")
+            raise ParameterValidationError(f"Ay sayı 1-{MAX_RELATIVE_MONTHS} aralığında olmalıdır, gəldi: {amount}")
         return f"(date_trunc('month', current_date) - interval '{amount} months')"
     if not 1 <= amount <= MAX_RELATIVE_DAYS:
-        raise ValueError(f"Gün sayı 1-{MAX_RELATIVE_DAYS} aralığında olmalıdır, gəldi: {amount}")
+        raise ParameterValidationError(f"Gün sayı 1-{MAX_RELATIVE_DAYS} aralığında olmalıdır, gəldi: {amount}")
     return f"(current_date - interval '{amount} days')"
 
 
@@ -107,6 +136,17 @@ def find_time_dimension(model: dict):
     return None
 
 
+def _same_column(a, b) -> bool:
+    """
+    İki sütun adı eynidirmi — REGİSTRDƏN ASILI OLMAYARAQ.
+
+    Infer Agent tarix sütununu köhnə registrlə göndərə bilər ("BANK_DATE").
+    Sadə == müqayisəsi bunu görmür: açıq dövr TAPILMIR, üstündən bir də
+    default dövr qoyulur və eyni sorğuda iki tarix şərti qalır.
+    """
+    return isinstance(a, str) and isinstance(b, str) and a.lower() == b.lower()
+
+
 def _period_filter_slots(operation: str) -> list:
     """Bu əməliyyat üçün tarix şərtinin ola biləcəyi filtr siyahıları."""
     if operation == "share":
@@ -116,17 +156,54 @@ def _period_filter_slots(operation: str) -> list:
     return ["filters"]
 
 
+# Dövr BİR sətir kimi daşınır: effective_period["value"], sub["period_value"],
+# fallback-a ötürülən hədd — hamısı sadə string müqayisəsi ilə işləyir.
+# İKİ HƏDDLİ pəncərə ona görə ayırıcı ilə kodlanır:
+#
+#     "last_n_months:12|<last_n_months:6"
+#      └ aşağı hədd (>=)  └ yuxarı həddin OPERATORU + dəyəri
+#
+# ÖLÇÜLÜB (16.09.2026, qəbul sualı 1): period_value_of() UYĞUN GƏLƏN BİRİNCİ
+# filtri qaytarırdı, yəni "12 ay əvvəldən 6 ay əvvələdək" pəncərəsi
+# "last_n_months:12" kimi normallaşırdı — YUXARI HƏDD İTİRDİ. Həmin dəyəri
+# miras alan növbəti alt-sual son 12 AYIN HAMISINI götürürdü, birincinin
+# işlətdiyi 12→6 dilimini yox. İki rəqəm eyni cavabda yan-yana düşür,
+# etiketlər isə hər ikisini "eyni dövr" kimi göstərir.
+PERIOD_RANGE_SEP = "|"
+_UPPER_OPERATORS = ("<=", "<")
+
+
+def split_period_value(period_value):
+    """
+    Dövr dəyərini hissələrinə ayırır: (aşağı_hədd, yuxarı_operator, yuxarı_hədd).
+
+    Tək həddli dəyərdə son iki element None-dur. Yalnız yuxarı həddi olan
+    pəncərədə aşağı hədd boş sətirdir — apply_period() onda tək "<" şərti
+    yazır (əvvəl belə pəncərə səhvən ">=" şərtinə çevrilirdi).
+    """
+    if not isinstance(period_value, str) or PERIOD_RANGE_SEP not in period_value:
+        return period_value, None, None
+    lower, _, upper = period_value.partition(PERIOD_RANGE_SEP)
+    for operator in _UPPER_OPERATORS:
+        if upper.startswith(operator):
+            return lower, operator, upper[len(operator):]
+    return lower, "<", upper
+
+
 def accepts_period(unit: dict, model: dict) -> bool:
     """
     Bu unit-ə tarix aralığı tətbiq oluna bilərmi?
 
-    Snapshot modellər (portfolio_snapshot) XEYR — onlarda dövr "ən son gün"dür,
-    aralıq deyil; apply_snapshot_default_filter bunu artıq idarə edir.
-    'time_series' də XEYR — trend öz təbiətinə görə geniş dövrü əhatə etməlidir.
+    Snapshot modellərin trend olmayan unit-ləri XEYR — onlarda dövr "ən son
+    gün"dür, aralıq deyil; apply_snapshot_default_filter bunu idarə edir.
+    Trend unit-ləri tarix filtrini qəbul edir: istifadəçinin açıq ili/aralığı
+    və ya unit-in sənədləşdirilmiş default pəncərəsi trendi məhdudlaşdıra bilər.
     """
-    if unit.get("operation") == "time_series":
+    if unit.get("operation") == "compare":
+        # compare: iki dövrü ÖZÜ təyin edir — üçüncü filtr əlavə etmək
+        # mənasızdır və op_compare onu onsuz da "filters" slotunda görməz.
         return False
-    if model.get("snapshot_date_column"):
+    if model.get("snapshot_date_column") and not is_trend_unit(unit):
         return False
     return find_time_dimension(model) is not None
 
@@ -138,9 +215,29 @@ def has_explicit_period(semantic_query: dict, unit: dict, model: dict) -> bool:
         return False
     for slot in _period_filter_slots(unit.get("operation", "aggregate")):
         for f in semantic_query.get(slot) or []:
-            if isinstance(f, dict) and f.get("column") == time_col:
+            if isinstance(f, dict) and _same_column(f.get("column"), time_col):
                 return True
     return False
+
+
+def without_period_filters(semantic_query: dict, unit: dict, model: dict) -> dict:
+    """Return the query without filters on the model's time dimension."""
+    time_col = find_time_dimension(model)
+    if not time_col:
+        return semantic_query
+    result = dict(semantic_query)
+    for slot in _period_filter_slots(unit.get("operation", "aggregate")):
+        if slot not in result:
+            continue
+        kept = [
+            item for item in result.get(slot) or []
+            if not (isinstance(item, dict) and _same_column(item.get("column"), time_col))
+        ]
+        if kept:
+            result[slot] = kept
+        else:
+            result.pop(slot, None)
+    return result
 
 
 def apply_period(semantic_query: dict, unit: dict, model: dict, period_value: str) -> dict:
@@ -159,10 +256,20 @@ def apply_period(semantic_query: dict, unit: dict, model: dict, period_value: st
     time_col = find_time_dimension(model)
     operation = unit.get("operation", "aggregate")
     target_slot = "scope_filters" if operation == "share" else "filters"
+    lower, upper_operator, upper = split_period_value(period_value)
+
+    # İki həddli pəncərə İKİ şərt kimi yazılır — yuxarı həddi atmaq
+    # "12→6 ay əvvəl" dilimini "son 12 ay"a çevirərdi.
+    added = []
+    if lower:
+        added.append({"column": time_col, "operator": ">=", "value": lower})
+    if upper:
+        added.append({"column": time_col, "operator": upper_operator, "value": upper})
+    if not added:
+        return semantic_query
+
     result = dict(semantic_query)
-    result[target_slot] = list(result.get(target_slot) or []) + [
-        {"column": time_col, "operator": ">=", "value": period_value}
-    ]
+    result[target_slot] = list(result.get(target_slot) or []) + added
     return result
 
 
@@ -176,17 +283,31 @@ def period_value_of(semantic_query: dict, unit: dict, model: dict):
     semantic_query-dəki tarix şərtinin DƏYƏRİ (müqayisə üçün normallaşdırılmış).
     Yoxdursa None. Snapshot modellərdə "__snapshot__" qaytarır — bu, aralıq
     deyil, ayrıca bir dövr NÖVÜDÜR və aralıqlarla müqayisə edilməməlidir.
+
+    HƏR İKİ hədd varsa nəticə birləşdirilmiş dəyərdir (bax PERIOD_RANGE_SEP) —
+    yalnız birincisini qaytarmaq pəncərəni səssizcə genişləndirirdi.
     """
-    if model.get("snapshot_date_column"):
+    if model.get("snapshot_date_column") and not is_trend_unit(unit):
         return "__snapshot__"
     time_col = find_time_dimension(model)
     if not time_col:
         return None
+
+    lower, upper = None, None
     for slot in _period_filter_slots(unit.get("operation", "aggregate")):
         for f in semantic_query.get(slot) or []:
-            if isinstance(f, dict) and f.get("column") == time_col:
-                return str(f.get("value"))
-    return None
+            if not (isinstance(f, dict) and _same_column(f.get("column"), time_col)):
+                continue
+            operator = str(f.get("operator") or ">=").strip()
+            if operator in _UPPER_OPERATORS:
+                if upper is None:
+                    upper = (operator, str(f.get("value")))
+            elif lower is None:
+                lower = str(f.get("value"))
+
+    if upper is None:
+        return lower
+    return f"{lower or ''}{PERIOD_RANGE_SEP}{upper[0]}{upper[1]}"
 
 
 def period_kind(semantic_query: dict, unit: dict, model: dict) -> str:
@@ -200,15 +321,19 @@ def period_kind(semantic_query: dict, unit: dict, model: dict) -> str:
     'trend' ayrıca sayılır: time_series bütün ayları göstərməlidir, ona görə
     həddsiz olması qüsur deyil.
     """
+    if is_trend_unit(unit):
+        return "trend"
     if model.get("snapshot_date_column"):
         return "snapshot"
-    if unit.get("operation") == "time_series":
-        return "trend"
     return "range" if period_value_of(semantic_query, unit, model) else "unbounded"
 
 
 def _describe_single_filter(f: dict) -> str:
     value = f.get("value")
+    if value == CURRENT_MONTH:
+        return "bu ay"
+    if value == LATEST_DATE:
+        return "ən son mövcud tarix (daxil)"
     if isinstance(value, str) and value.startswith("__MAX__:"):
         return "ən son mövcud tarixə əsasən"
     match = RELATIVE_PERIOD.match(str(value)) if isinstance(value, str) else None
@@ -222,7 +347,11 @@ def _describe_single_filter(f: dict) -> str:
 
 
 def _describe_period_filters(filters: list, time_col: str) -> str:
-    matches = [f for f in filters or [] if isinstance(f, dict) and f.get("column") == time_col]
+    # REGİSTRDƏN ASILI OLMAYAN müqayisə: hər yerdə _same_column() işlədilir,
+    # burada isə sadə == qalmışdı. Agent "BANK_DATE" göndərsə, tarix şərti
+    # TAPILMIR və etiket "bütün tarixi məlumat" olur — halbuki SQL-də hədd var.
+    matches = [f for f in filters or []
+               if isinstance(f, dict) and _same_column(f.get("column"), time_col)]
     if not matches:
         return ""
     if len(matches) == 1:
@@ -232,11 +361,42 @@ def _describe_period_filters(filters: list, time_col: str) -> str:
     if starts and ends:
         # Aralıq bağlıdır — başlanğıcı "...dən indiyədək" kimi açıq
         # oxutmaq YANLIŞDIR (indiyədək deyil, son tarixədək davam edir).
-        start_value = starts[0].get("value")
-        start_text = (_describe_single_filter(starts[0])
-                      if RELATIVE_PERIOD.match(str(start_value)) else str(start_value))
-        return f"{start_text} – {ends[0].get('value')}"
+        start_value = str(starts[0].get("value"))
+        end_value = str(ends[0].get("value"))
+        start_match = RELATIVE_PERIOD.match(start_value)
+        end_match = RELATIVE_PERIOD.match(end_value)
+        # Hər iki hədd nisbidirsə (compare-in "əvvəlki dövr"ü) xam dəyər
+        # sızmamalıdır: "son 12 ay – last_n_months:6" oxunmurdu.
+        if start_match and end_match:
+            word = "ay" if start_match.group(1) == "months" else "gün"
+            return (f"{start_match.group(2)} {word} əvvəldən "
+                    f"{end_match.group(2)} {word} əvvələdək")
+        start_text = _describe_single_filter(starts[0]) if start_match else start_value
+        end_text = _describe_single_filter(ends[0]) if end_match or end_value == LATEST_DATE else end_value
+        if ends[0].get("operator") == "<=" and end_value != LATEST_DATE:
+            end_text += " (daxil)"
+        elif ends[0].get("operator") == "<" and re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_value):
+            end_text += " (daxil deyil)"
+        return f"{start_text} – {end_text}"
     return "; ".join(_describe_single_filter(m) for m in matches)
+
+
+def describe_period_value(period_value: str) -> str:
+    """
+    Dövr DƏYƏRİNİ ("last_n_months:6") azərbaycanca yazır ("son 6 ay").
+
+    describe_period() unit və model tələb edir; dinamik SQL-in isə unit-i
+    YOXDUR. Etiket orada da göstərilməlidir — dövrü tətbiq edib adını
+    deməmək məhz gizli fərqdir.
+    """
+    lower, upper_operator, upper = split_period_value(period_value)
+    parts = []
+    if lower:
+        parts.append(_describe_single_filter({"value": lower}))
+    if upper:
+        parts.append(_describe_single_filter({"operator": upper_operator,
+                                              "value": upper}) + "-dək")
+    return " ".join(parts) or "dövr həddi yoxdur"
 
 
 def describe_period(unit: dict, model: dict, semantic_query: dict) -> str:
@@ -264,10 +424,14 @@ def describe_period(unit: dict, model: dict, semantic_query: dict) -> str:
         if found:
             break
 
-    if operation == "time_series":
-        current = ("cari ay daxildir" if semantic_query.get("include_current_period")
-                  else "cari ay xaric tutulur")
-        base = found or "bütün mövcud aylar üzrə"
+    if is_trend_unit(unit):
+        grain = unit.get("granularity", "month")
+        period_word = "gün" if grain == "day" else "il" if grain == "year" else "ay"
+        period_plural = {"day": "günlər", "year": "illər", "month": "aylar"}.get(
+            grain, "aylar")
+        current = (f"cari {period_word} daxildir" if semantic_query.get("include_current_period")
+                   else f"cari {period_word} xaric tutulur")
+        base = found or f"bütün mövcud {period_plural} üzrə"
         return f"{base} ({current})"
 
     if found:
@@ -328,6 +492,73 @@ def _get_dims_and_measures(model: dict):
     return dims, measures
 
 
+def _check_required_filters(semantic_query: dict, unit: dict, model: dict) -> None:
+    """
+    MƏCBURİ filtr sütunları verilibmi?
+
+    group_by-dan FƏRQLİ olaraq burada avtomatik əlavə etmək OLMAZ: filtrin
+    dəyəri lazımdır və onu uydurmaq nəticəni səssizcə dəyişərdi.
+
+    ÖLÇÜLÜB (eyni defekt sinfi): satis_dovr_muqayisesi hər iki dövr yuvasında
+    'tarix' tələb edir. Agent onu buraxsa, heç nə əlavə etmir və hər iki SELECT
+    filtrsiz qalır — nəticə iki EYNİ bütün-tarix sətri olur və cavab
+    "dəyişiklik yoxdur" kimi səssizcə YANLIŞ çıxır. Ona görə burada dayanılır:
+    bu, ADR-0008-in məhdud təkrar sorğusunu işə salır.
+    """
+    for slot, spec in (unit.get("parameters") or {}).items():
+        if slot == "group_by":
+            continue          # məcburi qruplaşdırma avtomatik əlavə olunur
+        required = (spec or {}).get("required") or []
+        if not required:
+            continue
+        given = {str(f.get("column", "")).lower()
+                 for f in semantic_query.get(slot) or [] if isinstance(f, dict)}
+        for column in required:
+            real = real_column_name(column, model)
+            if real.lower() not in given:
+                raise ParameterValidationError(
+                    f"'{slot}' yuvasında '{real}' MƏCBURİDİR, verilməyib. "
+                    f"Bu unit onsuz mənasız nəticə verir "
+                    f"(zaman sütunu üçün: 'last_n_months:N' və ya YYYY-MM-DD)"
+                )
+
+
+def _check_required_group_by(group_by: list, unit: dict, model: dict) -> None:
+    """Reject a proposal that omits a trusted unit's required row grain."""
+    required = ((unit.get("parameters") or {}).get("group_by") or {}).get("required") or []
+    if not required:
+        return
+    present = {str(c).lower() for c in group_by}
+    missing = []
+    for column in required:
+        real = real_column_name(column, model)
+        if real.lower() not in present:
+            missing.append(real)
+    if missing:
+        raise ParameterValidationError(
+            "Infer Agent unit-in məcburi group_by sütunlarını qaytarmayıb: "
+            + ", ".join(missing)
+        )
+
+
+def real_column_name(col_name: str, model: dict) -> str:
+    """
+    Modeldəki HƏQİQİ sütun adı — registr fərqi normallaşdırılır.
+
+    resolve_column SQL ifadəsi üçün bunu onsuz da edir, amma group_by adı həm də
+    ÇIXIŞ SÜTUNUNUN ADI kimi və share_of_total-un partition yoxlamasında
+    işlədilir. Datamart 07.09.2026-da kiçik hərfə keçəndən sonra model
+    'product_code' saxlayır, LLM isə hələ də 'PRODUCT_CODE' göndərə bilir:
+    normallaşdırma olmasa SQL 'product_code' üzrə qruplaşır, yoxlama isə
+    'PRODUCT_CODE' axtarır və əsassız xəta verir.
+    """
+    dims, measures = _get_dims_and_measures(model)
+    if col_name in dims or col_name in measures:
+        return col_name
+    lower_map = {c.lower(): c for c in list(dims) + list(measures)}
+    return lower_map.get(str(col_name).lower(), col_name)
+
+
 def _is_numeric(value) -> bool:
     if isinstance(value, bool):
         return False
@@ -340,9 +571,20 @@ def _is_numeric(value) -> bool:
         return False
 
 
+def canonical_number(value):
+    """Return a numeric JSON scalar for an unambiguous numeric string."""
+    if isinstance(value, bool) or not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text):
+        return value
+    number = float(text)
+    return int(number) if number.is_integer() else number
+
+
 def _is_date_like(value) -> bool:
     text = str(value)
-    if RELATIVE_PERIOD.match(text):
+    if text == CURRENT_MONTH or RELATIVE_PERIOD.match(text):
         return True
     return bool(re.match(r"^\d{4}-\d{2}(-\d{2})?", text))
 
@@ -356,18 +598,21 @@ def validate_filter(filter_item: dict, model: dict) -> tuple:
     operator = operator.upper() if operator.lower() == "in" else operator
 
     if operator not in ("=", "!=", ">", "<", ">=", "<=", "IN"):
-        raise ValueError(f"İcazə verilməyən operator: {operator}")
+        raise ParameterValidationError(f"İcazə verilməyən operator: {operator}")
 
     dims, measures = _get_dims_and_measures(model)
 
     # Case-insensitive uyğunlaşdırma: LLM sütun adını fərqli böyük/kiçik
-    # hərflə yazsa (interest_rate vs INTEREST_RATE), real adı tapırıq
+    # hərflə yazsa (interest_rate vs interest_rate), real adı tapırıq
     if column not in dims and column not in measures:
         column_lower_map = {c.lower(): c for c in list(dims.keys()) + list(measures.keys())}
         real_column = column_lower_map.get(column.lower())
         if real_column is None:
-            raise ValueError(
-                f"Filter sütunu '{column}' modeldə ('{model['name']}') tapılmadı"
+            # İcazə verilən adlar da göstərilir: bu mesaj Infer Agent-ə geri
+            # verilir (ADR-0008, bounded re-ask) və düzəliş üçün ona lazımdır.
+            raise ParameterValidationError(
+                f"Filter sütunu '{column}' modeldə ('{model['name']}') tapılmadı. "
+                f"Mövcud sütunlar: {', '.join(sorted(dims))}"
             )
         column = real_column  # real adla əvəz et
 
@@ -389,21 +634,31 @@ def validate_filter(filter_item: dict, model: dict) -> tuple:
             f"filtr və ya qruplaşdırma üçün istifadə edilə bilməz"
         )
 
+    if value == LATEST_DATE:
+        if column != find_time_dimension(model) or operator != "<=":
+            raise ParameterValidationError("Ən son tarix yalnız zaman sütununun daxil olan yuxarı həddi ola bilər")
+        return column, operator, value
+
     # TİP YOXLAMASI. Enum siyahısı olmayan sütunlarda (məs. 39 fərqli 'term')
     # əvvəllər heç bir dəyər yoxlanışı yox idi: model "term = 'Son 12 ay'"
     # göndərdi, sətir bigint sütuna düşdü və sorğu İCRA VAXTI qırıldı.
     # İndi bu, kompilyasiya mərhələsində, aydın mesajla dayandırılır.
     if column in dims:
         data_type = dims[column].get("data_type")
+        if data_type == "number":
+            if isinstance(value, list):
+                value = [canonical_number(candidate) for candidate in value]
+            else:
+                value = canonical_number(value)
         for candidate in (value if isinstance(value, list) else [value]):
             if data_type == "number" and not _is_numeric(candidate):
-                raise ValueError(
+                raise ParameterValidationError(
                     f"'{column}' rəqəm sütunudur, '{candidate}' isə mətndir. "
                     f"Tarix aralığı üçün rəqəm sütununu istifadə etmək olmaz — "
                     f"zaman sütununda 'last_n_months:N' yazın"
                 )
             if data_type == "date" and not _is_date_like(candidate):
-                raise ValueError(
+                raise ParameterValidationError(
                     f"'{column}' tarix sütunudur, '{candidate}' uyğun deyil. "
                     f"Qəbul olunur: YYYY-MM-DD və ya 'last_n_months:N'"
                 )
@@ -414,7 +669,7 @@ def validate_filter(filter_item: dict, model: dict) -> tuple:
             values_to_check = value if isinstance(value, list) else [value]
             for v in values_to_check:
                 if v not in allowed:
-                    raise ValueError(
+                    raise ParameterValidationError(
                         f"'{v}' dəyəri '{column}' üçün icazə verilən siyahıda deyil: {allowed}"
                     )
 
@@ -433,7 +688,7 @@ def resolve_column(col_name: str, model: dict, models: dict, relationships: list
     Qaytarır: (sql_ifadə, join_sql yoxsa None)
 
     Case-insensitive: LLM sütun adını fərqli böyük/kiçik hərflə yazsa
-    (is_vip vs IS_VIP), real adı tapır.
+    (is_vip vs is_vip), real adı tapır.
     """
     dims, measures = _get_dims_and_measures(model)
 
@@ -451,14 +706,14 @@ def resolve_column(col_name: str, model: dict, models: dict, relationships: list
 
     if col_name in dims or col_name in measures:
         expr = f"{alias}.{_q(col_name)}"
-        # IS_VIP kimi sütunlarda NULL real biznes mənası daşıyır ("VIP deyil").
+        # is_vip kimi sütunlarda NULL real biznes mənası daşıyır ("VIP deyil").
         # Qruplaşdırmada NULL ayrıca səbət yaratmasın deyə modeldə elan olunan
         # etiketə çevrilir — ekspertin SQL-lərindəki coalesce(...) ilə eyni.
         if col_name in dims and dims[col_name].get("null_as") is not None:
             expr = f"coalesce({expr}, {_lit(dims[col_name]['null_as'])})"
         return expr, None
 
-    for rel in relationships:
+    for rel in relationships or []:
         if rel["from_model"] == model["name"]:
             target_model = models[rel["to_model"]]
             target_dims, target_measures = _get_dims_and_measures(target_model)
@@ -478,10 +733,51 @@ def resolve_column(col_name: str, model: dict, models: dict, relationships: list
                 )
                 return f"{join_alias}.{_q(target_col_name)}", join_sql
 
-    raise ValueError(f"Sütun '{col_name}' heç bir modeldə tapılmadı (model: {model['name']})")
+    raise ParameterValidationError(
+        f"Sütun '{col_name}' heç bir modeldə tapılmadı (model: {model['name']})")
 
 
-def build_where_sql(filters: list, model: dict, models: dict, relationships: list, alias: str = "m") -> tuple:
+MONTH_PERIOD = re.compile(r"^last_n_months:\d{1,4}$")
+
+
+def close_month_periods(filters: list, alias: str = "m") -> list:
+    """
+    "son N ay" filtrinə YUXARI hədd əlavə edir: son N TAM ay.
+
+    ÖLÇÜLÜB: "son 6 ayın satışlarını əvvəlki 6 ayla müqayisə et" —
+      son_dovr    >= 2026-03-01                       -> 6 ay + 7 gün
+      onceki_dovr >= 2025-09-01 və < 2026-03-01       -> tam 6 ay
+    Yəni müqayisə BƏRABƏR OLMAYAN pəncərələr arasında gedirdi və artım
+    şişirdilmiş görünürdü.
+
+    Domen ekspertinin öz SQL-lərində də konvensiya budur (bax
+    inputs/q_a_deposit.md, Q1):
+        tarix >= date_trunc('month', current_date) - 365
+        and tarix <  date_trunc('month', current_date)
+
+    Yalnız AYLIQ nisbi dövrə tətbiq olunur — "son 30 gün" təbii olaraq bu günü
+    əhatə edir. Həmin sütunda artıq yuxarı hədd varsa TOXUNULMUR (məs. compare
+    şablonunun ikinci dövrü onsuz da bağlıdır).
+    """
+    result = list(filters or [])
+    bounded = {str(f.get("column")).lower() for f in result
+               if isinstance(f, dict) and f.get("operator") in ("<", "<=", "between")}
+    for f in list(result):
+        if not isinstance(f, dict) or f.get("operator") not in (">=", ">"):
+            continue
+        if not MONTH_PERIOD.match(str(f.get("value", ""))):
+            continue
+        column = str(f.get("column"))
+        if column.lower() in bounded:
+            continue
+        result.append({"column": column, "operator": "<",
+                       "value": "__CURRENT_MONTH_START__"})
+        bounded.add(column.lower())
+    return result
+
+
+def build_where_sql(filters: list, model: dict, models: dict, relationships: list,
+                    alias: str = "m", close_periods: bool = True) -> tuple:
     """
     Filtrləri doğrulayır və WHERE bəndinə çevirir.
     Qaytarır: (şərtlər_siyahısı, əlavə_join_sql_seti)
@@ -492,7 +788,14 @@ def build_where_sql(filters: list, model: dict, models: dict, relationships: lis
     """
     conditions = []
     joins = set()
-    for f in filters or []:
+    for f in (close_month_periods(filters, alias) if close_periods else (filters or [])):
+        # Compiler-in özünün əlavə etdiyi hədd — model dəyəri deyil, ona görə
+        # tip/enum yoxlamasından keçmir (__MAX__ ilə eyni məntiq).
+        if f.get("value") == "__CURRENT_MONTH_START__":
+            column = real_column_name(f["column"], model)
+            conditions.append(
+                f"{alias}.{_q(column)} < date_trunc('month', current_date)")
+            continue
         if isinstance(f.get("value"), str) and f["value"].startswith("__MAX__:"):
             _, ref = f["value"].split(":", 1)
             table, column = ref.rsplit(".", 1)
@@ -509,14 +812,30 @@ def build_where_sql(filters: list, model: dict, models: dict, relationships: lis
 
         if operator == "IN":
             if not isinstance(value, list):
-                raise ValueError(f"'IN' operatoru üçün 'value' siyahı (list) olmalıdır, gəldi: {type(value)}")
+                raise ParameterValidationError(
+                    f"'IN' operatoru üçün 'value' siyahı (list) olmalıdır, gəldi: {type(value)}")
             formatted_values = ", ".join(_lit(v) for v in value)
             conditions.append(f"{col_sql} in ({formatted_values})")
-        elif isinstance(value, str) and RELATIVE_PERIOD.match(value):
+        elif value == LATEST_DATE:
+            conditions.append(f"{col_sql} <= {latest_date_sql(model)}")
+        elif isinstance(value, str) and (value == CURRENT_MONTH or RELATIVE_PERIOD.match(value)):
             conditions.append(f"{col_sql} {operator} {relative_period_sql(value)}")
         else:
             conditions.append(f"{col_sql} {operator} {_lit(value)}")
     return conditions, joins
+
+
+def row_count_label(model: dict) -> str:
+    """
+    Say sütununun ÇIXIŞ ADI.
+
+    R1 düzəlişindən sonra bu sütun sətirləri yox, MÜQAVİLƏLƏRİ sayır — amma adı
+    "row_count" qalmışdı. Ölçülüb: dərin təhlil onu "əməliyyat sayı" kimi oxudu
+    (təsadüfən doğru), istifadəçi isə cədvəldə "row_count" görürdü.
+    Modeldə müqavilə ölçüsü yoxdursa (məs. flow cədvəli) ad DƏYİŞMİR — orada
+    ifadə həqiqətən count(*)-dır və "contract_count" YALAN olardı.
+    """
+    return "contract_count" if model.get("row_count_measure") else "row_count"
 
 
 def row_count_expr(model: dict, alias: str = "m") -> str:
@@ -528,7 +847,7 @@ def row_count_expr(model: dict, alias: str = "m") -> str:
     Model 'row_count_measure' elan edibsə, həqiqi say onun cəmidir.
 
     Ölçülüb (satış cədvəli): count(*) = 25,057 sətir, amma
-    sum("CONTRACT_REF_NO_count") = 407,052 müqavilə — 16 dəfə fərq.
+    sum("contract_ref_no_count") = 407,052 müqavilə — 16 dəfə fərq.
     """
     measure = model.get("row_count_measure")
     return f"sum({alias}.{_q(measure)})" if measure else "count(*)"
@@ -545,7 +864,7 @@ def row_count_case_expr(model: dict, condition: str, alias: str = "m") -> str:
 def get_default_agg(model: dict, measure_column: str, allow_approximate: bool = False) -> str:
     for ms in model["measures"]:
         if ms["column"] == measure_column:
-            # Non-additive measure (məs. CIF_countd) sətirlər üzrə cəmlənəndə
+            # Non-additive measure (məs. cif_countd) sətirlər üzrə cəmlənəndə
             # eyni müştəri bir neçə məhsulda təkrar sayılır. Ölçülüb: bir gündə
             # 12.6% şişmə. Unit açıq şəkildə icazə verməyibsə, rədd edirik.
             if ms.get("additive") is False and not allow_approximate:
@@ -556,6 +875,56 @@ def get_default_agg(model: dict, measure_column: str, allow_approximate: bool = 
                 )
             return ms["default_agg"]
     raise ValueError(f"Measure '{measure_column}' modeldə tapılmadı")
+
+
+RANGE_OPERATORS = (">=", ">", "<=", "<", "between")
+
+
+def check_snapshot_range(semantic_query: dict, unit: dict, model: dict) -> None:
+    """
+    Snapshot cədvəlində tarix ARALIĞI QADAĞANDIR.
+
+    Snapshot cədvəlinin hər sətri bir günün TAM mənzərəsidir; günlər üzrə
+    cəmlənə bilməz. apply_snapshot_default_filter tarix filtri YOXDURSA ən son
+    günü qoyur — amma filtr VARSA toxunmurdu, və aralıq verildikdə hər gün
+    cəmlənirdi.
+
+    ÖLÇÜLÜB (ekspertin Q4 sualı): model
+        bank_date >= last_n_months:12 AND bank_date < '2023-10-15'
+    verdi; snapshot qoruması işə düşmədi. Dinamik SQL də eyni səhvi etdi və
+    aylıq "portfel" 20.50 mlrd AZN göstərdi — həqiqi portfel 2.15 mlrd-dır,
+    yəni ~10 dəfə şişirdilmiş rəqəm CAVABDA FAKT KİMİ verildi.
+
+    Bərabərlik (bir konkret gün) və compiler-in öz "__MAX__" filtri qalır.
+    """
+    snapshot_col = model.get("snapshot_date_column")
+    if not snapshot_col:
+        return
+    # snapshot_time_series aralığı təhlükəsiz şəkildə emal edir: əvvəlcə hər
+    # dövrün ən son mövcud snapshot tarixini seçir, yalnız sonra məbləği
+    # aqreqasiya edir. Pilot logundakı aylıq portfel sorğuları bu xüsusi
+    # əməliyyat olmadan gündəlik stock-ları cəmləyib şişirdirdi.
+    if (unit.get("operation") == "snapshot_time_series"
+            or (unit.get("operation") == "ranked_breakdown" and unit.get("time_column"))):
+        return
+    for slot in ("filters", "scope_filters", "subgroup_filters",
+                 "period_a_filters", "period_b_filters"):
+        for f in semantic_query.get(slot) or []:
+            if not isinstance(f, dict):
+                continue
+            if not _same_column(f.get("column"), snapshot_col):
+                continue
+            value = f.get("value")
+            if isinstance(value, str) and value.startswith("__MAX__:"):
+                continue
+            if str(f.get("operator", "=")).lower() in RANGE_OPERATORS:
+                raise ValueError(
+                    f"'{snapshot_col}' snapshot (gün mənzərəsi) sütunudur — "
+                    f"tarix ARALIĞI verilə bilməz, çünki günlər cəmlənir və "
+                    f"nəticə dəfələrlə şişirdilmiş olur. Ya heç bir tarix "
+                    f"filtri vermə (ən son gün avtomatik seçilir), ya da bir "
+                    f"konkret gün üçün '=' işlət (məs. '2026-03-31')."
+                )
 
 
 def apply_snapshot_default_filter(filters: list, model: dict, temporal_scope: str = "latest_snapshot") -> list:
@@ -612,11 +981,11 @@ from {source_table} m
 def op_aggregate(model: dict, models: dict, relationships: list,
                   measure_column: str, filters: list, group_by: list,
                   metric_name: str, count_distinct_column: str = None,
-                  temporal_scope: str = "latest_snapshot") -> str:
+                  temporal_scope: str = "latest_snapshot", close_periods: bool = True) -> str:
     agg_func = get_default_agg(model, measure_column)
 
     filters = apply_snapshot_default_filter(filters, model, temporal_scope)
-    conditions, joins = build_where_sql(filters, model, models, relationships)
+    conditions, joins = build_where_sql(filters, model, models, relationships, close_periods=close_periods)
 
     group_by_parts = []
     for col in group_by or []:
@@ -679,14 +1048,14 @@ from subgroup, total
 
 def op_share(model: dict, models: dict, relationships: list,
              measure_column: str, subgroup_filters: list, total_filters: list,
-             group_by: list, metric_name: str, temporal_scope: str = "latest_snapshot") -> str:
+             group_by: list, metric_name: str, temporal_scope: str = "latest_snapshot", close_periods: bool = True) -> str:
     agg_func = get_default_agg(model, measure_column)
 
     subgroup_filters = apply_snapshot_default_filter(subgroup_filters, model, temporal_scope)
     total_filters = apply_snapshot_default_filter(total_filters, model, temporal_scope)
 
-    subgroup_conditions, joins1 = build_where_sql(subgroup_filters, model, models, relationships)
-    total_conditions, joins2 = build_where_sql(total_filters, model, models, relationships)
+    subgroup_conditions, joins1 = build_where_sql(subgroup_filters, model, models, relationships, close_periods=close_periods)
+    total_conditions, joins2 = build_where_sql(total_filters, model, models, relationships, close_periods=close_periods)
     joins = joins1 | joins2
 
     group_by_parts = []
@@ -762,9 +1131,9 @@ def op_share_case_when(model: dict, models: dict, relationships: list,
                         case_value_a: str, case_value_b: str,
                         label_a: str, label_b: str,
                         filters: list, group_by: list, metric_name: str,
-                        temporal_scope: str = "latest_snapshot") -> str:
+                        temporal_scope: str = "latest_snapshot", close_periods: bool = True) -> str:
     filters = apply_snapshot_default_filter(filters, model, temporal_scope)
-    conditions, joins = build_where_sql(filters, model, models, relationships)
+    conditions, joins = build_where_sql(filters, model, models, relationships, close_periods=close_periods)
     where_clause = ("where " + " and ".join(conditions)) if conditions else ""
 
     group_by_parts = []
@@ -808,7 +1177,7 @@ COMPARE_TEMPLATE = """select
     '{period_a_label}' as period_label,
     {group_by_select}
     {agg_func}(m.{measure_column}) as period_value,
-    count(*) as row_count
+    {row_count_expr} as {count_label}{bounds_a}
 from {source_table} m
 {joins}
 {where_a}
@@ -820,7 +1189,7 @@ select
     '{period_b_label}' as period_label,
     {group_by_select}
     {agg_func}(m.{measure_column}) as period_value,
-    count(*) as row_count
+    {row_count_expr} as {count_label}{bounds_b}
 from {source_table} m
 {joins}
 {where_b}
@@ -832,11 +1201,12 @@ order by period_label{order_by_extra}"""
 def op_compare(model: dict, models: dict, relationships: list,
                measure_column: str, period_a_filters: list, period_b_filters: list,
                period_a_label: str, period_b_label: str, metric_name: str,
-               group_by: list = None) -> str:
+               group_by: list = None, close_periods: bool = True,
+               report_period_bounds: bool = False) -> str:
     agg_func = get_default_agg(model, measure_column)
 
-    conditions_a, joins1 = build_where_sql(period_a_filters, model, models, relationships)
-    conditions_b, joins2 = build_where_sql(period_b_filters, model, models, relationships)
+    conditions_a, joins1 = build_where_sql(period_a_filters, model, models, relationships, close_periods=close_periods)
+    conditions_b, joins2 = build_where_sql(period_b_filters, model, models, relationships, close_periods=close_periods)
     joins = joins1 | joins2
 
     where_a = ("where " + " and ".join(conditions_a)) if conditions_a else ""
@@ -863,7 +1233,25 @@ def op_compare(model: dict, models: dict, relationships: list,
         group_by_clause = ""
         order_by_extra = ""
 
+    def bounds(filters):
+        if not report_period_bounds:
+            return ""
+        column = find_time_dimension(model)
+        parts = []
+        for name, operators in (("start", (">=", ">")), ("end", ("<=", "<"))):
+            bound = next((f for f in filters if str(f.get("column", "")).lower() == column.lower()
+                          and f.get("operator") in operators), None)
+            if not bound:
+                raise ParameterValidationError("Müqayisə dövrünün sərhədi yoxdur")
+            value = bound["value"]
+            expr = latest_date_sql(model) if value == LATEST_DATE else (
+                relative_period_sql(value) if RELATIVE_PERIOD.fullmatch(str(value)) else _lit(value))
+            parts.append(f"cast({expr} as date) as __period_{name}")
+        return ",\n    " + ",\n    ".join(parts)
+
     return COMPARE_TEMPLATE.format(
+        row_count_expr=row_count_expr(model),
+        count_label=row_count_label(model),
         agg_func=agg_func,
         measure_column=_q(measure_column),
         source_table=_tbl(model),
@@ -875,6 +1263,7 @@ def op_compare(model: dict, models: dict, relationships: list,
         group_by_select=group_by_select,
         group_by_clause=group_by_clause,
         order_by_extra=order_by_extra,
+        bounds_a=bounds(period_a_filters), bounds_b=bounds(period_b_filters),
     )
 
 
@@ -889,7 +1278,7 @@ TIME_SERIES_TEMPLATE = """with periods as (
     select
         date_trunc('{granularity}', m.{time_column}) as period,
         {group_by_select}{agg_func}(m.{measure_column}) as period_value,
-        {row_count_expr} as period_row_count
+        {row_count_expr} as period_{count_label}{extra_select}
     from {source_table} m
     {joins}
     {where_clause}
@@ -898,7 +1287,7 @@ TIME_SERIES_TEMPLATE = """with periods as (
 select
     period,
     {group_by_select_out}period_value,
-    period_row_count,
+    period_{count_label},{extra_out}
     lag(period_value) over ({partition_clause}order by period) as prior_period_value,
     round(
         (100.0 * (period_value - lag(period_value) over ({partition_clause}order by period))
@@ -929,19 +1318,40 @@ def op_time_series(model: dict, models: dict, relationships: list,
                     measure_column: str, filters: list, time_column: str,
                     granularity: str, metric_name: str,
                     include_current_period: bool = False,
-                    group_by: list = None) -> str:
+                    group_by: list = None, close_periods: bool = True,
+                    outputs: list = None) -> str:
+    """
+    Aylıq sıra + istəyə bağlı ƏLAVƏ ÇIXIŞLAR.
+
+    'outputs' breakdown-dakı ilə EYNİ mexanizmdir (build_output_sql) — həmin
+    kind-lər, həmin yoxlamalar. Trendə ona görə lazımdır ki, ekspertin bəzi
+    sualları eyni aylıq sətirdə həm həcm, həm də ÇƏKİLİ ORTA faiz istəyir.
+
+    ÖLÇÜLÜB (17.09.2026, qəbul sualı 13): ekspertin öz SQL-i məhz budur —
+    ay + məhsul üzrə prolonged_contracts, total_prolonged_lcy VƏ
+    weighted_avg_interest_rate. Bizim trend unit-i çəkili ortanı VERƏ
+    BİLMİRDİ, uzadilma_icmali isə aylıq deyil; nəticədə sual üç işlətmədən
+    üçündə dinamik SQL-ə düşdü. Şablona bir slot əlavə etmək yeni SQL yazmaq
+    deyil — mövcud çıxış mexanizmini trendə də açmaqdır.
+
+    Pəncərə funksiyaları (share_of_total) BURADA İŞLƏMİR: 'periods' CTE-si
+    onsuz da qruplaşdırılıb, ikinci dəfə pəncərə açmaq mənasızdır.
+    """
     agg_func = get_default_agg(model, measure_column)
 
     filters = apply_snapshot_default_filter(filters, model)
-    conditions, joins = build_where_sql(filters, model, models, relationships)
+    conditions, joins = build_where_sql(filters, model, models, relationships, close_periods=close_periods)
 
     # Yarımçıq cari dövr DEFAULT olaraq kənarlaşdırılır — şablonun özündə,
     # modelin filtrindən asılı olmayaraq. Yalnız istifadəçi açıq şəkildə
     # "bu ay indiyə qədər" deyəndə daxil edilir.
     if not include_current_period:
-        conditions = conditions + [
-            current_period_guard(f"m.{_q(time_column)}", granularity)
-        ]
+        # close_month_periods() "son N ay" filtrinə eyni həddi onsuz da əlavə
+        # edir — iki dəfə yazmaq SQL-i lüzumsuz uzadır.
+        guard = current_period_guard(f"m.{_q(real_column_name(time_column, model))}",
+                                     granularity)
+        if guard not in conditions:
+            conditions = conditions + [guard]
 
     where_clause = ("where " + " and ".join(conditions)) if conditions else ""
 
@@ -967,7 +1377,21 @@ def op_time_series(model: dict, models: dict, relationships: list,
     else:
         group_by_select = group_by_select_out = group_by_extra = partition_clause = order_extra = ""
 
+    # Əlavə çıxışlar 'periods' CTE-sində hesablanır və olduğu kimi ötürülür.
+    extra_select, extra_out = "", ""
+    for spec in outputs or []:
+        kind = spec.get("kind", "sum")
+        if kind == "share_of_total":
+            raise ValueError(
+                "time_series çıxışında 'share_of_total' işlədilə bilməz — "
+                "sətirlər onsuz da dövr üzrə qruplaşdırılıb")
+        extra_select += ",\n        " + build_output_sql(model, spec, group_by_parts)
+        extra_out += "\n    " + _safe_label(spec["name"]) + ","
+
     return TIME_SERIES_TEMPLATE.format(
+        extra_select=extra_select,
+        extra_out=extra_out,
+        count_label=row_count_label(model),
         group_by_select=group_by_select,
         group_by_select_out=group_by_select_out,
         group_by_extra=group_by_extra,
@@ -985,13 +1409,218 @@ def op_time_series(model: dict, models: dict, relationships: list,
     )
 
 
+SNAPSHOT_TIME_SERIES_TEMPLATE = """with snapshot_dates as (
+    select
+        date_trunc('{granularity}', s.{time_column}) as period,
+        max(s.{time_column}) as snapshot_date
+    from {source_table} s
+    {snapshot_where}
+    group by date_trunc('{granularity}', s.{time_column})
+),
+periods as (
+    select
+        d.period,
+        d.snapshot_date,
+        {group_by_select}{agg_func}(m.{measure_column}) as period_value,
+        {row_count_expr} as period_{count_label}{extra_select}
+    from {source_table} m
+    join snapshot_dates d on m.{time_column} = d.snapshot_date
+    {joins}
+    {where_clause}
+    group by d.period, d.snapshot_date{group_by_extra}
+)
+select
+    period,
+    snapshot_date,
+    {group_by_select_out}period_value,
+    period_{count_label},{extra_out}
+    lag(period_value) over ({partition_clause}order by period) as prior_period_value,
+    round(
+        (100.0 * (period_value - lag(period_value) over ({partition_clause}order by period))
+        / nullif(lag(period_value) over ({partition_clause}order by period), 0))::numeric,
+        2
+    ) as {metric_name}
+from periods
+order by period desc{order_extra}"""
+
+
+def op_snapshot_time_series(model: dict, models: dict, relationships: list,
+                            measure_column: str, filters: list, time_column: str,
+                            granularity: str, metric_name: str,
+                            include_current_period: bool = False,
+                            group_by: list = None, close_periods: bool = True,
+                            outputs: list = None) -> str:
+    """Stock cədvəli üçün hər dövrün son snapshot-ını seçən təhlükəsiz trend."""
+    snapshot_name = model.get("snapshot_date_column")
+    if not snapshot_name:
+        raise ValueError("snapshot_time_series yalnız snapshot modelində işləyir")
+    snapshot_column = real_column_name(snapshot_name, model)
+    time_column = real_column_name(time_column, model)
+    if not snapshot_column or snapshot_column != time_column:
+        raise ValueError("snapshot_time_series modelin snapshot tarix sütununu tələb edir")
+    if granularity not in ("day", "month", "quarter", "year"):
+        raise ValueError(f"Dəstəklənməyən trend granularity-si: {granularity}")
+
+    # Tarix seçimi yalnız zaman şərtlərinə baxır. Segmentin həmin gün sətri
+    # yoxdursa köhnə günü seçib fərqli segmentləri müxtəlif tarixlərdən
+    # müqayisə etmək olmaz; snapshot tarixi bütün cədvəl üçün vahiddir.
+    time_filters = [f for f in filters or []
+                    if _same_column(f.get("column"), time_column)]
+    snapshot_conditions, snapshot_joins = build_where_sql(
+        time_filters, model, models, relationships, alias="s",
+        close_periods=close_periods)
+    if snapshot_joins:
+        raise ValueError("snapshot tarixinin seçimi başqa cədvələ qoşula bilməz")
+
+    conditions, joins = build_where_sql(
+        filters, model, models, relationships, alias="m",
+        close_periods=close_periods)
+    if not include_current_period:
+        snapshot_guard = current_period_guard(f"s.{_q(time_column)}", granularity)
+        outer_guard = current_period_guard(f"m.{_q(time_column)}", granularity)
+        if snapshot_guard not in snapshot_conditions:
+            snapshot_conditions.append(snapshot_guard)
+        if outer_guard not in conditions:
+            conditions.append(outer_guard)
+
+    group_by_parts = []
+    for column in group_by or []:
+        column_sql, join_sql = resolve_column(column, model, models, relationships)
+        group_by_parts.append(column_sql)
+        if join_sql:
+            joins.add(join_sql)
+    if group_by_parts:
+        bare = [_q(column) for column in (group_by or [])]
+        labelled = [f"{expr} as {name}" if expr != f"m.{name}" else expr
+                    for expr, name in zip(group_by_parts, bare)]
+        group_by_select = ", ".join(labelled) + ",\n        "
+        group_by_select_out = ", ".join(bare) + ",\n    "
+        group_by_extra = ", " + ", ".join(group_by_parts)
+        partition_clause = "partition by " + ", ".join(bare) + " "
+        order_extra = ", " + ", ".join(bare)
+    else:
+        group_by_select = group_by_select_out = group_by_extra = ""
+        partition_clause = order_extra = ""
+
+    extra_select, extra_out = "", ""
+    for spec in outputs or []:
+        if spec.get("kind") == "share_of_total":
+            raise ValueError("snapshot_time_series çıxışında share_of_total işlədilə bilməz")
+        extra_select += ",\n        " + build_output_sql(model, spec, group_by_parts)
+        extra_out += "\n    " + _safe_label(spec["name"]) + ","
+
+    agg_func = get_default_agg(model, measure_column)
+    return SNAPSHOT_TIME_SERIES_TEMPLATE.format(
+        granularity=granularity,
+        time_column=_q(time_column),
+        source_table=_tbl(model),
+        snapshot_where=("where " + " and ".join(snapshot_conditions))
+        if snapshot_conditions else "",
+        group_by_select=group_by_select,
+        group_by_select_out=group_by_select_out,
+        group_by_extra=group_by_extra,
+        partition_clause=partition_clause,
+        order_extra=order_extra,
+        agg_func=agg_func,
+        measure_column=_q(measure_column),
+        row_count_expr=row_count_expr(model),
+        count_label=row_count_label(model),
+        extra_select=extra_select,
+        extra_out=extra_out,
+        joins="\n".join(joins),
+        where_clause=("where " + " and ".join(conditions)) if conditions else "",
+        metric_name=_q(metric_name),
+    )
+
+
+def op_ranked_breakdown(model: dict, models: dict, relationships: list,
+                        outputs: list, filters: list, group_by: list,
+                        ranking: dict, direction=None,
+                        time_column=None, granularity: str = "month",
+                        measure_column=None,
+                        include_current_period: bool = False,
+                        close_periods: bool = True) -> str:
+    """Top/bottom N; dövrlü halda rank hər period daxilində ayrıca hesablanır."""
+    direction = str(direction or ranking.get("direction", "desc")).lower()
+    if direction not in ("asc", "desc"):
+        raise ValueError("rank_direction yalnız 'asc' və ya 'desc' ola bilər")
+    limit = ranking.get("limit", 1)
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("ranking.limit 1-100 aralığında tam ədəd olmalıdır")
+
+    output_names = {_safe_label(spec["name"]) for spec in outputs or []}
+    if time_column:
+        if not measure_column:
+            raise ValueError("Dövrlü ranking measure tələb edir")
+        target = ranking.get("by", "period_value")
+        allowed = output_names | {"period_value", f"period_{row_count_label(model)}"}
+        if target not in allowed:
+            raise ValueError(f"Ranking çıxışı '{target}' mövcud deyil: {sorted(allowed)}")
+        operation = (op_snapshot_time_series if model.get("snapshot_date_column")
+                     else op_time_series)
+        base = operation(
+            model, models, relationships,
+            measure_column=measure_column,
+            filters=filters,
+            time_column=time_column,
+            granularity=granularity,
+            metric_name="__ranked_change_pct",
+            include_current_period=include_current_period,
+            group_by=group_by,
+            close_periods=close_periods,
+            outputs=outputs,
+        )
+        partition = "partition by period "
+        tie_order = ", ".join(_q(c) for c in group_by or [])
+        final_order = 'period desc, "__rank"' + (", " + tie_order if tie_order else "")
+    else:
+        target = ranking.get("by")
+        allowed = output_names | {str(c) for c in group_by or []}
+        if not target or target not in allowed:
+            raise ValueError(f"Ranking çıxışı '{target}' mövcud deyil: {sorted(allowed)}")
+        base = op_breakdown(
+            model, models, relationships,
+            outputs=outputs,
+            filters=filters,
+            group_by=group_by,
+            temporal_scope=ranking.get("temporal_scope", "latest_snapshot"),
+            close_periods=close_periods,
+        )
+        partitions = ranking.get("partition_by") or []
+        unknown = {str(c) for c in partitions} - {str(c) for c in group_by or []}
+        if unknown:
+            raise ValueError(f"Ranking partition_by group_by-da yoxdur: {sorted(unknown)}")
+        partition = ("partition by " + ", ".join(_q(c) for c in partitions) + " "
+                     if partitions else "")
+        tie_order = ", ".join(_q(c) for c in group_by or [])
+        final_order = '"__rank"' + (", " + tie_order if tie_order else "")
+
+    # Greenplum QUALIFY dəstəkləmir. Rank ayrıca CTE-də hesablanır, filtr isə
+    # növbəti SELECT-də tətbiq olunur; pilot logundakı sintaksis xətası bu
+    # ümumi şablonla aradan qalxır. Eyni ölçülü nəticələr dense_rank ilə birgə
+    # saxlanır və group_by açarları ilə sabit sırada göstərilir.
+    return f"""with base_values as (
+{base}
+),
+ranked_values as (
+    select
+        base_values.*,
+        dense_rank() over ({partition}order by {_q(target)} {direction} nulls last) as "__rank"
+    from base_values
+)
+select *
+from ranked_values
+where "__rank" <= {limit}
+order by {final_order}"""
+
+
 # ---------------------------------------------------------------------------
 # OVERLAP əməliyyatı bu PoC-də YOXDUR.
 #
 # "Neçə saving müştərisi eyni zamanda deposit müştərisidir" sualı iki müştəri
 # çoxluğunun kəsişməsini tələb edir — bunun üçün unikal müştəri açarı (cif)
-# lazımdır. dataiku_ai_coe aqreqat cədvəllərində belə açar YOXDUR: CIF_countd
-# və CIF_distinct sütunları saydır, identifikator deyil. Onları kəsişdirmək
+# lazımdır. dataiku_ai_coe aqreqat cədvəllərində belə açar YOXDUR: cif_countd
+# və cif_distinct sütunları saydır, identifikator deyil. Onları kəsişdirmək
 # riyazi olaraq mümkün deyil, təxmin etmək isə səssizcə yanlış cavab verərdi.
 # ---------------------------------------------------------------------------
 
@@ -1013,6 +1642,8 @@ def op_time_series(model: dict, models: dict, relationships: list,
 #   share_of_total  — 100 * sum(x) / sum(sum(x)) over (partition by ...)
 #   ratio           — sum(a) / sum(b)  (məs. orta bilet, müştəri başına)
 #   sum_where       — yalnız icazə verilən dəyərlər üçün cəm (məs. type='Closed')
+#   conditional_sum/share — etibarlı şərtə düşən ölçünün cəmi və ümumidə payı
+#   conditional_ratio — ayrı şərtli iki cəmin nisbəti
 # ---------------------------------------------------------------------------
 
 BREAKDOWN_TEMPLATE = """select
@@ -1023,11 +1654,22 @@ from {source_table} m
 {group_by_clause}
 {order_by_clause}"""
 
-ALLOWED_OUTPUT_KINDS = ("sum", "weighted_avg", "share_of_total", "ratio", "sum_where")
+ALLOWED_OUTPUT_KINDS = (
+    "sum", "weighted_avg", "share_of_total", "ratio", "sum_where",
+    "conditional_sum", "conditional_share", "conditional_ratio",
+)
 
 
 def _measure_sql(model: dict, column: str, alias: str = "m") -> str:
-    """Ölçü sütununa istinad — modeldə olmalıdır."""
+    """
+    Ölçü sütununa istinad — modeldə olmalıdır.
+
+    Ad MODELDƏKİ registrə salınır: units.yml əl ilə yazılır, model isə canlı
+    Greenplum-dan yaradılır (make models). Datamartda registr dəyişəndə
+    (07.09.2026 qismən kiçik hərfə keçid) yeganə həqiqət mənbəyi modeldir —
+    units.yml-in registri SQL-ə sızmamalıdır.
+    """
+    column = real_column_name(column, model)
     _, measures = _get_dims_and_measures(model)
     if column not in measures:
         raise ValueError(f"'{column}' modeldə ('{model['name']}') measure kimi tapılmadı")
@@ -1035,12 +1677,61 @@ def _measure_sql(model: dict, column: str, alias: str = "m") -> str:
 
 
 def _dimension_sql(model: dict, column: str, alias: str = "m") -> str:
+    column = real_column_name(column, model)
     dims, _ = _get_dims_and_measures(model)
     if column not in dims:
         raise ValueError(f"'{column}' modeldə ('{model['name']}') ölçü (dimension) deyil")
     if dims[column].get("unusable"):
         raise ValueError(f"'{column}' sütunu hazırda tam boşdur (NULL)")
     return f"{alias}.{_q(column)}"
+
+
+def _condition_sql(model: dict, condition: dict, alias: str = "m") -> str:
+    """Trusted-unit output condition; unlike WHERE filters it may cite a measure."""
+    if not isinstance(condition, dict) or not condition.get("column"):
+        raise ValueError("Şərt üçün 'column' tələb olunur")
+    column = real_column_name(str(condition["column"]), model)
+    dims, measures = _get_dims_and_measures(model)
+    operator = str(condition.get("operator", "=")).upper()
+    if operator not in ("=", "!=", ">", "<", ">=", "<=", "IN"):
+        raise ParameterValidationError(f"Çıxış şərtində icazə verilməyən operator: {operator}")
+    value = condition.get("value")
+
+    if column in dims:
+        column, operator, value = validate_filter(
+            {"column": column, "operator": operator, "value": value}, model)
+    elif column in measures:
+        if not measures[column].get("conditional_filter"):
+            raise ValueError(
+                f"Measure şərti '{column}' conditional output üçün domen "
+                "metadata-sında təsdiqlənməyib")
+        values = value if isinstance(value, list) else [value]
+        if any(not _is_numeric(v) for v in values):
+            raise ParameterValidationError(
+                f"Measure şərtinin dəyəri rəqəm olmalıdır: {value!r}")
+        value = ([canonical_number(v) for v in value]
+                 if isinstance(value, list) else canonical_number(value))
+    else:
+        raise ParameterValidationError(f"Şərt sütunu '{column}' modeldə tapılmadı")
+
+    col_sql = f"{alias}.{_q(column)}"
+    if operator == "IN":
+        if not isinstance(value, list) or not value:
+            raise ParameterValidationError(
+                "Çıxış şərtində IN üçün boş olmayan siyahı tələb olunur")
+        return f"{col_sql} in ({', '.join(_lit(v) for v in value)})"
+    return f"{col_sql} {operator} {_lit(value)}"
+
+
+def _output_conditions_sql(model: dict, spec: dict, alias: str = "m") -> str:
+    conditions = list(spec.get("conditions") or [])
+    if spec.get("condition"):
+        conditions.append(spec["condition"])
+    if not conditions:
+        raise ValueError(f"'{spec.get('name')}': conditional output üçün şərt yoxdur")
+    return " and ".join(
+        _condition_sql(model, item, alias)
+        for item in conditions)
 
 
 def _round(expr: str, digits) -> str:
@@ -1082,30 +1773,42 @@ def build_output_sql(model: dict, spec: dict, group_by_parts: list) -> str:
     elif kind == "ratio":
         numerator = f"sum({_measure_sql(model, spec['numerator'])})"
         denominator = f"sum({_measure_sql(model, spec['denominator'])})"
-        # Opsional: hər tərəfə CASE WHEN filtri (məs. numerator yalnız
-        # type IN ('New','Reactivated') olan sətirlər üzrə cəmlənsin).
-        # Bu, iki artıq-hesablanmış sum_where nəticəsinin nisbətini almaq
-        # üçün lazımdır (məs. gross_outflow/gross_inflow).
-        num_filter = spec.get("numerator_filter")
-        if num_filter:
-            column = _dimension_sql(model, num_filter["column"])
-            value_list = ", ".join(_lit(v) for v in num_filter["values"])
-            inner = f"abs({_measure_sql(model, spec['numerator'])})" if num_filter.get("absolute") else _measure_sql(model, spec['numerator'])
-            numerator = f"sum(case when {column} in ({value_list}) then {inner} else 0 end)"
-        den_filter = spec.get("denominator_filter")
-        if den_filter:
-            column = _dimension_sql(model, den_filter["column"])
-            value_list = ", ".join(_lit(v) for v in den_filter["values"])
-            inner = f"abs({_measure_sql(model, spec['denominator'])})" if den_filter.get("absolute") else _measure_sql(model, spec['denominator'])
-            denominator = f"sum(case when {column} in ({value_list}) then {inner} else 0 end)"
-        multiplier = "100.0 * " if spec.get("as_percentage") else ""
-        expr = f"{multiplier}{numerator} / nullif({denominator}, 0)"
+        expr = f"{numerator} / nullif({denominator}, 0)"
+
+    elif kind in ("conditional_sum", "conditional_share"):
+        measure = _measure_sql(model, spec["measure"])
+        condition = _output_conditions_sql(model, spec)
+        inner = f"abs({measure})" if spec.get("absolute") else measure
+        numerator = f"sum(case when {condition} then {inner} else 0 end)"
+        expr = (numerator if kind == "conditional_sum" else
+                f"100.0 * {numerator} / nullif(sum({measure}), 0)")
+
+    elif kind == "conditional_ratio":
+        numerator_spec = spec.get("numerator") or {}
+        denominator_spec = spec.get("denominator") or {}
+        for label, part in (("numerator", numerator_spec),
+                            ("denominator", denominator_spec)):
+            if not isinstance(part, dict) or not part.get("measure"):
+                raise ValueError(f"'{name}': conditional_ratio {label} measure tələb edir")
+            if not (part.get("condition") or part.get("conditions")):
+                raise ValueError(f"'{name}': conditional_ratio {label} şərt tələb edir")
+
+        def conditional_sum(part):
+            measure = _measure_sql(model, part["measure"])
+            condition = _output_conditions_sql(model, part)
+            inner = f"abs({measure})" if part.get("absolute") else measure
+            return f"sum(case when {condition} then {inner} else 0 end)"
+
+        numerator = conditional_sum(numerator_spec)
+        denominator = conditional_sum(denominator_spec)
+        multiplier = 100.0 if spec.get("percent") else 1.0
+        expr = f"{multiplier} * {numerator} / nullif({denominator}, 0)"
 
     else:  # sum_where
         measure = _measure_sql(model, spec["measure"])
         column = _dimension_sql(model, spec["column"])
         dims, _ = _get_dims_and_measures(model)
-        allowed = dims[spec["column"]].get("allowed_values")
+        allowed = dims[real_column_name(spec["column"], model)].get("allowed_values")
         values = spec.get("values") or []
         if not values:
             raise ValueError(f"'{name}': sum_where üçün 'values' boş ola bilməz")
@@ -1124,28 +1827,14 @@ def build_output_sql(model: dict, spec: dict, group_by_parts: list) -> str:
 
 def op_breakdown(model: dict, models: dict, relationships: list,
                  outputs: list, filters: list, group_by: list,
-                 temporal_scope: str = "latest_snapshot",
-                 time_column: str = None, granularity: str = None) -> str:
+                 temporal_scope: str = "latest_snapshot", close_periods: bool = True) -> str:
     if not outputs:
         raise ValueError("breakdown üçün 'outputs' boş ola bilməz")
 
     filters = apply_snapshot_default_filter(filters, model, temporal_scope)
-    conditions, joins = build_where_sql(filters, model, models, relationships)
+    conditions, joins = build_where_sql(filters, model, models, relationships, close_periods=close_periods)
 
     group_by_parts, select_dims = [], []
-
-    # Opsional aylıq/gündəlik/illik qruplaşdırma — time_column verilibsə,
-    # bu, HƏMİŞƏ group_by-ın İLK sütunu kimi əlavə olunur (date_trunc ilə).
-    # Bu, breakdown-un çox-measure (say+məbləğ+çəkili-orta+pay) gücünü,
-    # time_series-in dövr-üzrə-ayırma gücü ilə birləşdirir.
-    if time_column:
-        time_col_sql, time_join = resolve_column(time_column, model, models, relationships)
-        if time_join:
-            joins.add(time_join)
-        period_expr = f"date_trunc('{granularity or 'month'}', {time_col_sql})"
-        group_by_parts.append(period_expr)
-        select_dims.append(f"{period_expr} as period")
-
     for column in group_by or []:
         column_sql, join_sql = resolve_column(column, model, models, relationships)
         group_by_parts.append(column_sql)
@@ -1158,10 +1847,13 @@ def op_breakdown(model: dict, models: dict, relationships: list,
     # share_of_total-un partition_by-ı GROUP BY-da olmayan sütuna istinad
     # edərsə, Postgres kriptik bir xəta verir ("must appear in GROUP BY").
     # Burada ƏVVƏLCƏDƏN, aydın mesajla tutulur — icra vaxtına qədər gözlənilmir.
-    group_by_set = set(group_by or [])
+    # Hər iki tərəf MODELDƏKİ ada salınır: group_by compile_query-də artıq
+    # normallaşdırılıb, partition_by isə units.yml-dən olduğu kimi gəlir.
+    group_by_set = {real_column_name(c, model) for c in group_by or []}
     for spec in outputs:
         if spec.get("kind") == "share_of_total":
-            for column in spec.get("partition_by") or []:
+            for column in (real_column_name(c, model)
+                           for c in spec.get("partition_by") or []):
                 if column not in group_by_set:
                     raise ValueError(
                         f"'{spec['name']}': partition_by='{column}' group_by-da yoxdur — "
@@ -1184,26 +1876,44 @@ def op_breakdown(model: dict, models: dict, relationships: list,
 
 def uses_approximate_measure(unit: dict, model: dict) -> bool:
     """
-    Unit həqiqətən non-additive ölçü (CIF_countd və s.) istifadə edirmi?
+    Unit həqiqətən non-additive ölçü (cif_countd və s.) istifadə edirmi?
 
     Yalnız 'allow_approximate' bayrağına baxmaq YANLIŞ olardı — bəzi unit-lər
     bayrağı daşıyır, amma çıxışlarında müştəri sayı yoxdur. Onda istifadəçiyə
     yersiz xəbərdarlıq göstərilərdi.
     """
     _, measures = _get_dims_and_measures(model)
-    non_additive = {name for name, spec in measures.items() if spec.get("additive") is False}
+    # REGİSTRDƏN ASILI OLMAYARAQ. units.yml əl ilə yazılır ('cif_distinct'),
+    # model isə canlı Greenplum-dan gəlir və satış cədvəli qarışıq registrdədir
+    # ('CIF_distinct'). Sadə çoxluq kəsişməsi bunu görmürdü: satis_strukturu,
+    # kanal_miksi_satis və uzadilma_icmali müştəri sayını CƏMLƏYİR, amma
+    # "təxmini" xəbərdarlığı HEÇ VAXT qalxmırdı (ölçülüb).
+    non_additive = {name.lower() for name, spec in measures.items()
+                    if spec.get("additive") is False}
     if not non_additive:
         return False
 
     used = set()
     based_on_measure = (unit.get("based_on") or {}).get("measure")
     if based_on_measure:
-        used.add(based_on_measure)
+        used.add(str(based_on_measure).lower())
     for spec in unit.get("outputs") or []:
         for key in ("measure", "numerator", "denominator", "weight"):
             if spec.get(key):
-                used.add(spec[key])
+                used.add(str(spec[key]).lower())
     return bool(used & non_additive)
+
+
+def _bind_output_conditions(outputs: list, semantic_query: dict) -> list:
+    """Unit output-un elan etdiyi condition slotunu validated runtime dəyərinə bağla."""
+    bound = []
+    for original in outputs or []:
+        spec = dict(original)
+        slot = spec.pop("condition_slot", None)
+        if slot:
+            spec["conditions"] = list(semantic_query.get(slot) or [])
+        bound.append(spec)
+    return bound
 
 
 def compile_query(semantic_query: dict) -> str:
@@ -1213,12 +1923,42 @@ def compile_query(semantic_query: dict) -> str:
 
     metric_name = semantic_query["metric"]
     metric_def = metrics[metric_name]
+
+    # ADR-0005: model YALNIZ icazə verilən yuvalara dəyər qoya bilər. Elan
+    # edilməyən yuva SƏSSİZCƏ atılırdı — ölçülüb: Infer Agent 'satis_hecmi'
+    # (aggregate) unit-inə "period_b_filters" göndərdi, slot nəzərə alınmadı və
+    # sorğu "son 6 ay" ilə eyni oldu; iki fərqli alt-sual təkrar sayılıb
+    # birləşdirildi və "əvvəlki 6 ay" rəqəmi heç vaxt hesablanmadı.
+    # "bu ay indiyə qədər" istəyi YALNIZ trendə deyil, hər əməliyyata aiddir:
+    # o olmadan "son N ay" = son N TAM ay (close_month_periods).
+    close_periods = not bool(semantic_query.get("include_current_period", False))
+
+    declared = set((metric_def.get("parameters") or {}).keys())
+    for slot in ("filters", "scope_filters", "subgroup_filters", "conditions",
+                 "period_a_filters", "period_b_filters", "group_by"):
+        if semantic_query.get(slot) and slot not in declared:
+            raise ParameterValidationError(
+                f"'{slot}' bu unit üçün elan edilməyib ({metric_name}). "
+                f"İcazə verilən parametrlər: {', '.join(sorted(declared)) or 'yoxdur'}"
+            )
     model = models[metric_def["based_on"]["model"]]
+    semantic_query = domain_policy.enforce(semantic_query, metric_def, model)
     measure_column = metric_def["based_on"].get("measure")
+    # units.yml əl ilə yazılır, model isə canlı Greenplum-dan gəlir —
+    # registr fərqi olarsa MODELDƏKİ ad üstündür.
+    if measure_column:
+        measure_column = real_column_name(measure_column, model)
     op_type = metric_def["operation"]
+    outputs = _bind_output_conditions(metric_def.get("outputs", []), semantic_query)
+    if semantic_query.get("rank_direction") and op_type != "ranked_breakdown":
+        raise ValueError("rank_direction yalnız ranked_breakdown unit-ində işlədilə bilər")
 
     user_filters = semantic_query.get("filters", [])
-    group_by = semantic_query.get("group_by", [])
+    group_by = [real_column_name(c, model)
+                for c in semantic_query.get("group_by") or []]
+    _check_required_group_by(group_by, metric_def, model)
+    _check_required_filters(semantic_query, metric_def, model)
+    check_snapshot_range(semantic_query, metric_def, model)
 
     if op_type == "aggregate":
         base_filters = metric_def.get("base_filters", [])
@@ -1232,6 +1972,7 @@ def compile_query(semantic_query: dict) -> str:
             metric_name=metric_name,
             count_distinct_column=count_distinct,
             temporal_scope=temporal_scope,
+            close_periods=close_periods,
         )
 
     elif op_type == "share":
@@ -1252,6 +1993,7 @@ def compile_query(semantic_query: dict) -> str:
             group_by=group_by,
             metric_name=metric_name,
             temporal_scope=temporal_scope,
+            close_periods=close_periods,
         )
 
     elif op_type == "share_case_when":
@@ -1259,7 +2001,7 @@ def compile_query(semantic_query: dict) -> str:
         return op_share_case_when(
             model, models, relationships,
             measure_column=measure_column,
-            case_column=metric_def["case_column"],
+            case_column=real_column_name(metric_def["case_column"], model),
             case_value_a=metric_def["case_value_a"],
             case_value_b=metric_def["case_value_b"],
             label_a=metric_def["label_a"],
@@ -1268,41 +2010,40 @@ def compile_query(semantic_query: dict) -> str:
             group_by=group_by,
             metric_name=metric_name,
             temporal_scope=temporal_scope,
+            close_periods=close_periods,
         )
 
     elif op_type == "compare":
+        # ÖLÇÜLÜB: burada yalnız unit-in öz sabit filtrləri və semantic_query-nin
+        # "filters" slotu oxunurdu. Infer Agent isə dövrləri DÜZGÜN olaraq
+        # period_a_filters / period_b_filters slotlarına yazır — onlar heç vaxt
+        # oxunmadığı üçün HƏR İKİ dövr WHERE-siz qalırdı: iki sətir də bütün
+        # tarixin cəmi olurdu. Nəticə eyni iki rəqəm idi, cavab isə "satışlar
+        # 73.6% azalıb" kimi TAMAMİLƏ YANLIŞ çıxırdı.
         base_a = metric_def.get("period_a_filters", [])
         base_b = metric_def.get("period_b_filters", [])
-        # LLM runtime-da DİNAMİK dövr göndərə bilər (məs. "2023 ilin oktyabrı
-        # ilə 2022-ni müqayisə et") — bu, units.yml-dəki SABİT period_a/b
-        # filters-dən FƏRQLİDİR. LLM-in göndərdiyi varsa, o, sabit dəyərin
-        # ÜSTÜNƏ deyil, ƏVƏZİNƏ keçir (əks halda iki fərqli tarix aralığı
-        # ziddiyyətli WHERE şərti yaradıb, heç bir sətir qaytarmazdı).
-        dynamic_a = semantic_query.get("period_a_filters")
-        dynamic_b = semantic_query.get("period_b_filters")
-        period_a_filters = dynamic_a if dynamic_a is not None else (base_a + user_filters)
-        period_b_filters = dynamic_b if dynamic_b is not None else (base_b + user_filters)
         return op_compare(
             model, models, relationships,
             measure_column=measure_column,
-            period_a_filters=period_a_filters,
-            period_b_filters=period_b_filters,
+            period_a_filters=base_a + user_filters + (semantic_query.get("period_a_filters") or []),
+            period_b_filters=base_b + user_filters + (semantic_query.get("period_b_filters") or []),
             period_a_label=metric_def.get("period_a_label", "period_a"),
             period_b_label=metric_def.get("period_b_label", "period_b"),
+            report_period_bounds=bool(semantic_query.get("report_period_bounds")),
             metric_name=metric_name,
             group_by=group_by,
+            close_periods=close_periods,
         )
 
     elif op_type == "breakdown":
         base_filters = metric_def.get("base_filters", [])
         return op_breakdown(
             model, models, relationships,
-            outputs=metric_def.get("outputs", []),
+            outputs=outputs,
             filters=base_filters + user_filters,
             group_by=group_by,
             temporal_scope=metric_def.get("temporal_scope", "latest_snapshot"),
-            time_column=metric_def.get("time_column"),
-            granularity=metric_def.get("granularity"),
+            close_periods=close_periods,
         )
 
     elif op_type == "time_series":
@@ -1313,11 +2054,46 @@ def compile_query(semantic_query: dict) -> str:
             model, models, relationships,
             measure_column=measure_column,
             filters=base_filters + user_filters,
-            time_column=metric_def["time_column"],
+            time_column=real_column_name(metric_def["time_column"], model),
             granularity=metric_def.get("granularity", "month"),
             metric_name=metric_name,
             include_current_period=include_current,
             group_by=group_by,
+            close_periods=close_periods,
+            outputs=outputs,
+        )
+
+    elif op_type == "snapshot_time_series":
+        base_filters = metric_def.get("base_filters", [])
+        include_current = bool(semantic_query.get("include_current_period", False))
+        return op_snapshot_time_series(
+            model, models, relationships,
+            measure_column=measure_column,
+            filters=base_filters + user_filters,
+            time_column=real_column_name(metric_def["time_column"], model),
+            granularity=metric_def.get("granularity", "month"),
+            metric_name=metric_name,
+            include_current_period=include_current,
+            group_by=group_by,
+            close_periods=close_periods,
+            outputs=outputs,
+        )
+
+    elif op_type == "ranked_breakdown":
+        base_filters = metric_def.get("base_filters", [])
+        return op_ranked_breakdown(
+            model, models, relationships,
+            outputs=outputs,
+            filters=base_filters + user_filters,
+            group_by=group_by,
+            ranking=metric_def.get("ranking") or {},
+            direction=semantic_query.get("rank_direction"),
+            time_column=(real_column_name(metric_def["time_column"], model)
+                         if metric_def.get("time_column") else None),
+            granularity=metric_def.get("granularity", "month"),
+            measure_column=measure_column,
+            include_current_period=bool(semantic_query.get("include_current_period", False)),
+            close_periods=close_periods,
         )
 
     else:
